@@ -270,6 +270,87 @@ class TestFileRead(unittest.TestCase):
         self.assertEqual(self.fs.zone_at(ino, 10), 0)   # 未分配 -> 空洞
 
 
+# ---------------------------------------------------------------------------
+# shell 测试
+# ---------------------------------------------------------------------------
+
+class ShellTestCase(unittest.TestCase):
+    def setUp(self):
+        import minix_shell
+        self.fs = open_test_fs()
+        self.out = io.StringIO()
+        self.shell = minix_shell.MinixShell(self.fs, stdout=self.out)
+
+    def run_cmd(self, line):
+        """执行一条命令并返回其输出."""
+        self.out.seek(0)
+        self.out.truncate()
+        self.shell.onecmd(line)
+        return self.out.getvalue()
+
+
+class TestShellNavigation(ShellTestCase):
+    def test_pwd_initial(self):
+        self.assertEqual(self.run_cmd("pwd"), "/\n")
+
+    def test_cd_and_pwd(self):
+        self.run_cmd("cd sub")
+        self.assertEqual(self.shell.cwd.num, 3)
+        self.assertEqual(self.run_cmd("pwd"), "/sub\n")
+        self.assertEqual(self.shell.prompt, "minix:/sub$ ")
+        self.run_cmd("cd ..")
+        self.assertEqual(self.run_cmd("pwd"), "/\n")
+
+    def test_cd_absolute_and_bare(self):
+        self.run_cmd("cd /sub")
+        self.run_cmd("cd")
+        self.assertEqual(self.run_cmd("pwd"), "/\n")
+
+    def test_cd_to_file_rejected(self):
+        out = self.run_cmd("cd hello.txt")
+        self.assertIn("不是目录", out)
+        self.assertEqual(self.shell.cwd.num, 1)
+
+    def test_cd_missing(self):
+        out = self.run_cmd("cd nowhere")
+        self.assertIn("错误", out)
+
+    def test_ls_plain(self):
+        out = self.run_cmd("ls")
+        self.assertIn("hello.txt", out)
+        self.assertIn("sub", out)
+        self.assertNotIn("..", out.split())
+
+    def test_ls_long(self):
+        out = self.run_cmd("ls -l")
+        self.assertIn("-rw-r--r--", out)
+        self.assertIn("hello.txt", out)
+        self.assertIn("14", out)  # hello.txt 大小
+        # 设备节点显示主/次设备号
+        tty_line = [l for l in out.splitlines() if l.endswith("tty")][0]
+        self.assertTrue(tty_line.startswith("crw-rw-rw-"))
+        self.assertIn("4,", tty_line)
+
+    def test_ls_path_argument(self):
+        out = self.run_cmd("ls /sub")
+        self.assertIn("note.txt", out)
+
+    def test_ls_single_file(self):
+        self.assertEqual(self.run_cmd("ls hello.txt"), "hello.txt\n")
+
+    def test_unknown_command(self):
+        self.assertIn("未知命令", self.run_cmd("bogus"))
+
+    def test_normalize_path(self):
+        import minix_shell
+        np = minix_shell.normalize_path
+        self.assertEqual(np("/", "sub"), "/sub")
+        self.assertEqual(np("/sub", ".."), "/")
+        self.assertEqual(np("/sub", "../sub/./x"), "/sub/x")
+        self.assertEqual(np("/", "/a/b/../c"), "/a/c")
+        self.assertEqual(np("/a", "/"), "/")
+
+
 @unittest.skipUnless(os.path.exists(IMG_PATH), "真实镜像 hdc-0.11.img 不存在")
 class TestRealImage(unittest.TestCase):
     """针对仓库中 Linux 0.11 真实镜像的集成测试."""
