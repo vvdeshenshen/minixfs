@@ -128,6 +128,59 @@ class MinixShell(cmd.Cmd):
                 self._print(self._format_long(inode, path) if long_fmt else path)
 
 
+    # ---- stat / inode --------------------------------------------------
+
+    def _print_inode_info(self, inode: Inode, name: str = None) -> None:
+        if name is not None:
+            self._print(f"  文件: {name}")
+        if inode.is_device:
+            major, minor = inode.devno
+            size_line = f"设备号: {major}, {minor} (raw {inode.zones[0]:#06x})"
+        else:
+            blocks = (inode.size + 1023) // 1024
+            size_line = f"大小: {inode.size} 字节 ({blocks} 块)"
+        self._print(f"  inode: {inode.num}    类型: {inode.type_name}")
+        self._print(f"  {size_line}")
+        self._print(f"  权限: {inode.mode_string()} ({inode.mode & 0o7777:04o})    "
+                    f"硬链接: {inode.nlinks}")
+        self._print(f"  属主: uid={inode.uid} gid={inode.gid}")
+        self._print(f"  修改时间: {inode.mtime_string()}")
+
+    def do_stat(self, arg: str) -> None:
+        """stat <路径>... -- 显示文件的 inode 元数据"""
+        args = self._args(arg)
+        if not args:
+            self._print("用法: stat <路径>...")
+            return
+        for i, path in enumerate(args):
+            if i:
+                self._print()
+            self._print_inode_info(self._resolve(path), name=path)
+
+    def do_inode(self, arg: str) -> None:
+        """inode <编号> -- 按编号显示 inode 的原始信息"""
+        args = self._args(arg)
+        if len(args) != 1:
+            self._print("用法: inode <编号>")
+            return
+        try:
+            num = int(args[0], 0)
+        except ValueError:
+            self._print(f"inode: 无效编号: {args[0]}")
+            return
+        inode = self.fs.get_inode(num)
+        allocated = self.fs.inode_allocated(num)
+        self._print(f"inode {num} ({'已分配' if allocated else '未分配'})")
+        self._print(f"  mode  = {inode.mode:#06x} ({inode.mode_string()}, "
+                    f"{inode.type_name})")
+        self._print(f"  uid   = {inode.uid}    gid = {inode.gid}    "
+                    f"nlinks = {inode.nlinks}")
+        self._print(f"  size  = {inode.size}")
+        self._print(f"  mtime = {inode.mtime} ({inode.mtime_string()})")
+        self._print(f"  zones = {list(inode.zones[:7])} "
+                    f"间接={inode.zones[7]} 二级间接={inode.zones[8]}")
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description="Minix v1 文件系统镜像浏览器")
     parser.add_argument("image", help="镜像文件路径(裸文件系统或带 MBR 的磁盘镜像)")

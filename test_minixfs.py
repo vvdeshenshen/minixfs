@@ -351,6 +351,48 @@ class TestShellNavigation(ShellTestCase):
         self.assertEqual(np("/a", "/"), "/")
 
 
+class TestShellStatInode(ShellTestCase):
+    def test_stat_file(self):
+        out = self.run_cmd("stat hello.txt")
+        self.assertIn("inode: 2", out)
+        self.assertIn("regular file", out)
+        self.assertIn("大小: 14 字节", out)
+        self.assertIn("-rw-r--r-- (0644)", out)
+        self.assertIn("uid=10 gid=20", out)
+
+    def test_stat_device(self):
+        out = self.run_cmd("stat /tty")
+        self.assertIn("character special file", out)
+        self.assertIn("设备号: 4, 0", out)
+
+    def test_stat_multiple(self):
+        out = self.run_cmd("stat hello.txt sub")
+        self.assertIn("inode: 2", out)
+        self.assertIn("inode: 3", out)
+        self.assertIn("directory", out)
+
+    def test_stat_no_args(self):
+        self.assertIn("用法", self.run_cmd("stat"))
+
+    def test_inode_command(self):
+        out = self.run_cmd("inode 5")
+        self.assertIn("inode 5 (已分配)", out)
+        self.assertIn("size  = 10240", out)
+        self.assertIn("zones = [8, 9, 10, 11, 12, 13, 14]", out)
+        self.assertIn("间接=15", out)
+        self.assertIn("二级间接=0", out)
+
+    def test_inode_unallocated(self):
+        self.assertIn("未分配", self.run_cmd("inode 8"))
+
+    def test_inode_out_of_range(self):
+        self.assertIn("错误", self.run_cmd("inode 999"))
+
+    def test_inode_invalid_arg(self):
+        self.assertIn("无效编号", self.run_cmd("inode abc"))
+        self.assertIn("用法", self.run_cmd("inode"))
+
+
 @unittest.skipUnless(os.path.exists(IMG_PATH), "真实镜像 hdc-0.11.img 不存在")
 class TestRealImage(unittest.TestCase):
     """针对仓库中 Linux 0.11 真实镜像的集成测试."""
