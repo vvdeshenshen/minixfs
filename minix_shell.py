@@ -12,6 +12,7 @@ import shlex
 import sys
 
 from minixfs import Inode, MinixError, MinixFS
+from pager import Pager, read_key_tty
 
 
 def normalize_path(base: str, path: str) -> str:
@@ -33,13 +34,13 @@ def normalize_path(base: str, path: str) -> str:
 class MinixShell(cmd.Cmd):
     intro = "Minix v1 文件系统浏览器, 输入 help 查看命令."
 
-    def __init__(self, fs: MinixFS, page_size: int = 23, input_fn=input, **kwargs):
+    def __init__(self, fs: MinixFS, pager_opts: dict = None, **kwargs):
         super().__init__(**kwargs)
         self.fs = fs
         self.cwd = fs.root
         self.cwd_path = "/"
-        self.page_size = page_size   # less 每页行数
-        self.input_fn = input_fn     # less 翻页交互, 测试时可注入
+        # less 分页器参数覆盖(height/width/read_key/use_ansi), 测试时注入
+        self.pager_opts = pager_opts or {}
         self._update_prompt()
 
     # ---- 基础设施 ----------------------------------------------------
@@ -263,29 +264,23 @@ class MinixShell(cmd.Cmd):
         self._print(f"{offset + len(data):08x}")
 
     def do_less(self, arg: str) -> None:
-        """less <路径> -- 分页查看文本文件, 空格/回车翻页, q 退出"""
+        """less <路径> -- 分页查看文本; j/k 行, f/b/n/p 屏, d/u 半屏, g/G 首尾, q 退出"""
         args = self._args(arg)
         if len(args) != 1:
             self._print("用法: less <路径>")
             return
         inode = self._resolve(args[0])
         text = self.fs.read_file(inode).decode("latin-1")
-        lines = text.splitlines()
-        page = self.page_size
-        pos = 0
-        while pos < len(lines):
-            for line in lines[pos:pos + page]:
-                self._print(line)
-            pos += page
-            if pos >= len(lines):
-                break
-            try:
-                key = self.input_fn(f"--更多-- ({min(pos, len(lines))}/{len(lines)} 行) ")
-            except (EOFError, KeyboardInterrupt):
-                self._print()
-                break
-            if key.strip().lower() == "q":
-                break
+        opts = dict(self.pager_opts)
+        if "read_key" not in opts and "use_ansi" not in opts:
+            # 只有输入输出都是终端才进入交互模式, 否则直接输出全部
+            interactive = (sys.stdin.isatty()
+                           and getattr(self.stdout, "isatty", lambda: False)())
+            if interactive:
+                opts["read_key"] = read_key_tty
+                opts["use_ansi"] = True
+        Pager(text.splitlines(), name=args[0],
+              write=self.stdout.write, **opts).run()
 
 
 def main(argv=None) -> int:

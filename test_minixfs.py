@@ -470,7 +470,6 @@ class TestShellFileDumpLess(ShellTestCase):
 
     def test_less_paging_and_quit(self):
         import minix_shell
-        # /sub/note.txt 只有一行, 用 big.bin 不合适; 构造多行文本走翻页逻辑
         orig = self.fs.read_file
         fake_text = b"\n".join(b"line %d" % i for i in range(10)) + b"\n"
 
@@ -479,24 +478,143 @@ class TestShellFileDumpLess(ShellTestCase):
             return fake_text if inode.num == 2 else orig(inode, *a, **k)
 
         self.fs.read_file = fake_read
-        prompts = []
-
-        def fake_input(prompt):
-            prompts.append(prompt)
-            return "q" if len(prompts) >= 2 else ""
-
+        keys = iter(["f", "q"])
         try:
-            shell = minix_shell.MinixShell(self.fs, page_size=3,
-                                           input_fn=fake_input, stdout=self.out)
+            shell = minix_shell.MinixShell(
+                self.fs, pager_opts={"height": 3, "read_key": lambda: next(keys)},
+                stdout=self.out)
             shell.onecmd("less hello.txt")
         finally:
             self.fs.read_file = orig
         out = self.out.getvalue()
         self.assertIn("line 0", out)
-        self.assertIn("line 5", out)      # 第二页已输出
-        self.assertNotIn("line 9", out)   # q 之后停止
-        self.assertEqual(len(prompts), 2)
-        self.assertIn("--更多--", prompts[0])
+        self.assertIn("line 3", out)      # f 翻到第二屏
+        self.assertNotIn("line 6", out)   # q 之后停止
+        self.assertIn("1-3/10 行 (30%)", out)
+
+
+class TestPager(unittest.TestCase):
+    """pager.Pager 的按键行为测试."""
+
+    LINES = [f"line {i}" for i in range(10)]
+
+    def run_pager(self, keys, lines=None, height=3, **kwargs):
+        """用脚本化按键跑分页器, 返回 (完整输出, 各次绘制的状态栏)."""
+        from pager import Pager
+        out = io.StringIO()
+        it = iter(keys)
+        Pager(lines if lines is not None else self.LINES,
+              name="t", height=height, write=out.write,
+              read_key=lambda: next(it), **kwargs).run()
+        text = out.getvalue()
+        statuses = [l for l in text.splitlines() if l.startswith("t ")]
+        return text, statuses
+
+    def test_non_interactive_dumps_all(self):
+        from pager import Pager
+        out = io.StringIO()
+        Pager(self.LINES, height=3, write=out.write).run()
+        self.assertEqual(out.getvalue(), "\n".join(self.LINES) + "\n")
+
+    def test_fits_one_screen_no_interaction(self):
+        text, statuses = self.run_pager([], lines=["a", "b"], height=5)
+        self.assertEqual(text, "a\nb\n")
+        self.assertEqual(statuses, [])  # 未进入交互, 未消费任何按键
+
+    def test_forward_and_status(self):
+        text, statuses = self.run_pager(["f", "q"])
+        self.assertEqual(statuses[0], "t 1-3/10 行 (30%)")
+        self.assertEqual(statuses[1], "t 4-6/10 行 (60%)")
+
+    def test_forward_clamps_at_end(self):
+        _, statuses = self.run_pager(["f", "f", "f", "f", "q"])
+        self.assertEqual(statuses[-1], "t 8-10/10 行 (100%) (END)")
+        self.assertEqual(statuses[-2], statuses[-1])  # 到底后不再前进
+
+    def test_backward(self):
+        _, statuses = self.run_pager(["f", "f", "b", "q"])
+        self.assertEqual(statuses[-1], "t 4-6/10 行 (60%)")
+
+    def test_n_p_page_aliases(self):
+        _, statuses = self.run_pager(["n", "p", "q"])
+        self.assertEqual(statuses[1], "t 4-6/10 行 (60%)")
+        self.assertEqual(statuses[2], "t 1-3/10 行 (30%)")
+
+    def test_j_k_line_movement(self):
+        _, statuses = self.run_pager(["j", "j", "k", "q"])
+        self.assertEqual(statuses[1], "t 2-4/10 行 (40%)")
+        self.assertEqual(statuses[2], "t 3-5/10 行 (50%)")
+        self.assertEqual(statuses[3], "t 2-4/10 行 (40%)")
+
+    def test_k_clamps_at_top(self):
+        _, statuses = self.run_pager(["k", "q"])
+        self.assertEqual(statuses[-1], "t 1-3/10 行 (30%)")
+
+    def test_half_screen_d_u(self):
+        _, statuses = self.run_pager(["d", "u", "q"], height=4)
+        self.assertEqual(statuses[1], "t 3-6/10 行 (60%)")
+        self.assertEqual(statuses[2], "t 1-4/10 行 (40%)")
+
+    def test_g_G_jump(self):
+        _, statuses = self.run_pager(["G", "g", "q"])
+        self.assertEqual(statuses[1], "t 8-10/10 行 (100%) (END)")
+        self.assertEqual(statuses[2], "t 1-3/10 行 (30%)")
+
+    def test_unknown_key_ignored(self):
+        _, statuses = self.run_pager(["x", "q"])
+        self.assertEqual(statuses[0], statuses[1])
+
+    def test_key_reader_exhausted_quits(self):
+        # 按键序列耗尽(StopIteration)等价于 q, 不应死循环或抛异常
+        text, _ = self.run_pager(["j"])
+        self.assertIn("line 1", text)
+
+    def test_width_truncation(self):
+        text, _ = self.run_pager(["q"], lines=["x" * 50] * 5, height=3, width=10)
+        self.assertIn("x" * 10 + "\n", text)
+        self.assertNotIn("x" * 11, text)
+
+    def test_ansi_mode_escapes(self):
+        from pager import Pager
+        out = io.StringIO()
+        it = iter(["q"])
+        Pager(self.LINES, name="t", height=3, write=out.write,
+              read_key=lambda: next(it), use_ansi=True).run()
+        text = out.getvalue()
+        self.assertIn("\x1b[2J\x1b[H", text)   # 清屏
+        self.assertIn("\x1b[7m", text)          # 反显状态栏
+        self.assertTrue(text.endswith("\n"))    # 退出时换行
+
+    def test_empty_file(self):
+        text, _ = self.run_pager([], lines=[])
+        self.assertEqual(text, "")
+
+
+class TestDecodeKey(unittest.TestCase):
+    """pager._decode_key 的转义序列翻译测试."""
+
+    def decode(self, chars):
+        from pager import _decode_key
+        it = iter(chars)
+        return _decode_key(lambda: next(it))
+
+    def test_plain_keys(self):
+        for ch in "jkfbnpdugGq":
+            self.assertEqual(self.decode(ch), ch)
+
+    def test_arrow_keys(self):
+        self.assertEqual(self.decode("\x1b[A"), "k")
+        self.assertEqual(self.decode("\x1b[B"), "j")
+
+    def test_page_keys(self):
+        self.assertEqual(self.decode("\x1b[5~"), "b")
+        self.assertEqual(self.decode("\x1b[6~"), "f")
+
+    def test_control_keys(self):
+        self.assertEqual(self.decode("\x03"), "q")   # Ctrl-C
+        self.assertEqual(self.decode("\x04"), "d")   # Ctrl-D
+        self.assertEqual(self.decode("\x15"), "u")   # Ctrl-U
+        self.assertEqual(self.decode([""]), "q")     # EOF
 
 
 @unittest.skipUnless(os.path.exists(IMG_PATH), "真实镜像 hdc-0.11.img 不存在")
