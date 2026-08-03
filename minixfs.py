@@ -255,6 +255,37 @@ class MinixFS:
         byte = bmap[(num % (BLOCK_SIZE * 8)) // 8]
         return bool(byte & (1 << (num % 8)))
 
+    # ---- 位图统计 -----------------------------------------------------
+
+    def _count_bitmap(self, start_block: int, nblocks: int, nbits: int) -> int:
+        """统计位图中第 1..nbits 位里已置位的个数.
+
+        位 0 保留(恒为 1), 有效范围之后的填充位(mkfs 置 1)不计入.
+        """
+        data = b"".join(self.read_block(start_block + i) for i in range(nblocks))
+        count = 0
+        for i in range(1, nbits + 1):
+            if data[i >> 3] & (1 << (i & 7)):
+                count += 1
+        return count
+
+    def fs_stats(self) -> dict:
+        """整个文件系统的使用统计.
+
+        inode 位图第 i 位对应 inode i;
+        zone 位图第 i 位(i>=1)对应 zone firstdatazone + i - 1,
+        数据 zone 总数 = nzones - firstdatazone.
+        """
+        sb = self.sb
+        total_zones = sb.nzones - sb.firstdatazone
+        return {
+            "total_inodes": sb.ninodes,
+            "used_inodes": self._count_bitmap(2, sb.imap_blocks, sb.ninodes),
+            "total_zones": total_zones,
+            "used_zones": self._count_bitmap(2 + sb.imap_blocks,
+                                             sb.zmap_blocks, total_zones),
+        }
+
     # ---- 数据 zone 映射与文件读取 ------------------------------------
 
     def zone_at(self, inode: Inode, index: int) -> int:

@@ -53,6 +53,11 @@ def build_image():
     # inode 位图: inode 0(保留) 和 1..7 已分配
     img[2 * BLOCK_SIZE] = 0xFF
 
+    # zone 位图: 位 0 保留, 位 i 对应 zone firstdatazone+i-1;
+    # 数据 zone 5..19 已用 -> 位 0..15 置位
+    img[3 * BLOCK_SIZE] = 0xFF
+    img[3 * BLOCK_SIZE + 1] = 0xFF
+
     mtime = 946684800  # 2000-01-01 00:00:00 UTC
     inodes = {
         1: _pack_inode(0o040755, 0, 5 * 16, mtime, 0, 3, [5]),
@@ -184,6 +189,15 @@ class TestInode(unittest.TestCase):
         self.assertTrue(self.fs.inode_allocated(1))
         self.assertTrue(self.fs.inode_allocated(7))
         self.assertFalse(self.fs.inode_allocated(8))
+
+    def test_fs_stats(self):
+        st = self.fs.fs_stats()
+        self.assertEqual(st["total_inodes"], 32)
+        self.assertEqual(st["used_inodes"], 7)
+        # 数据 zone 总数 = nzones(32) - firstdatazone(5) = 27
+        self.assertEqual(st["total_zones"], 27)
+        # zone 5..19 已用
+        self.assertEqual(st["used_zones"], 15)
 
 
 class TestDirectory(unittest.TestCase):
@@ -371,8 +385,14 @@ class TestShellStatInode(ShellTestCase):
         self.assertIn("inode: 3", out)
         self.assertIn("directory", out)
 
-    def test_stat_no_args(self):
-        self.assertIn("用法", self.run_cmd("stat"))
+    def test_stat_no_args_shows_fs_stats(self):
+        out = self.run_cmd("stat")
+        self.assertIn("文件系统统计", out)
+        self.assertIn("inode:     7 / 32 已用 (21.9%)", out)
+        self.assertIn("data zone: 15 / 27 已用 (55.6%)", out)
+        self.assertIn("起始 zone 5", out)
+        self.assertIn(f"共 {27 * 1024} 字节", out)
+        self.assertIn(f"已用 {15 * 1024} 字节", out)
 
     def test_inode_command(self):
         out = self.run_cmd("inode 5")

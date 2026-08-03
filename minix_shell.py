@@ -148,11 +148,27 @@ class MinixShell(cmd.Cmd):
         self._print(f"  属主: uid={inode.uid} gid={inode.gid}")
         self._print(f"  修改时间: {inode.mtime_string()}")
 
+    def _print_fs_stats(self) -> None:
+        sb = self.fs.sb
+        st = self.fs.fs_stats()
+        ipct = st["used_inodes"] / st["total_inodes"] * 100 if st["total_inodes"] else 0
+        zpct = st["used_zones"] / st["total_zones"] * 100 if st["total_zones"] else 0
+        self._print("文件系统统计:")
+        self._print(f"  块大小:    1024 字节    magic: {sb.magic:#06x} "
+                    f"(文件名上限 {sb.name_len} 字符)")
+        self._print(f"  inode:     {st['used_inodes']} / {st['total_inodes']} "
+                    f"已用 ({ipct:.1f}%)")
+        self._print(f"  data zone: {st['used_zones']} / {st['total_zones']} "
+                    f"已用 ({zpct:.1f}%), 起始 zone {sb.firstdatazone}")
+        self._print(f"  容量:      共 {st['total_zones'] * 1024} 字节, "
+                    f"已用 {st['used_zones'] * 1024} 字节, "
+                    f"空闲 {(st['total_zones'] - st['used_zones']) * 1024} 字节")
+
     def do_stat(self, arg: str) -> None:
-        """stat <路径>... -- 显示文件的 inode 元数据"""
+        """stat [路径]... -- 显示文件的 inode 元数据; 无参数时显示文件系统统计"""
         args = self._args(arg)
         if not args:
-            self._print("用法: stat <路径>...")
+            self._print_fs_stats()
             return
         for i, path in enumerate(args):
             if i:
