@@ -33,11 +33,13 @@ def normalize_path(base: str, path: str) -> str:
 class MinixShell(cmd.Cmd):
     intro = "Minix v1 文件系统浏览器, 输入 help 查看命令."
 
-    def __init__(self, fs: MinixFS, **kwargs):
+    def __init__(self, fs: MinixFS, page_size: int = 23, input_fn=input, **kwargs):
         super().__init__(**kwargs)
         self.fs = fs
         self.cwd = fs.root
         self.cwd_path = "/"
+        self.page_size = page_size   # less 每页行数
+        self.input_fn = input_fn     # less 翻页交互, 测试时可注入
         self._update_prompt()
 
     # ---- 基础设施 ----------------------------------------------------
@@ -179,6 +181,95 @@ class MinixShell(cmd.Cmd):
         self._print(f"  mtime = {inode.mtime} ({inode.mtime_string()})")
         self._print(f"  zones = {list(inode.zones[:7])} "
                     f"间接={inode.zones[7]} 二级间接={inode.zones[8]}")
+
+
+    # ---- file / dump / less --------------------------------------------
+
+    AOUT_MAGIC = {0o407: "OMAGIC", 0o410: "NMAGIC", 0o413: "ZMAGIC",
+                  0o314: "QMAGIC"}
+
+    def _classify(self, inode: Inode) -> str:
+        """file 命令的类型判定."""
+        if not inode.is_regular:
+            return inode.type_name
+        if inode.size == 0:
+            return "empty"
+        head = self.fs.read_file(inode, 0, 1024)
+        if len(head) >= 4:
+            magic = int.from_bytes(head[:4], "little")
+            if magic in self.AOUT_MAGIC:
+                return f"a.out 可执行文件 ({self.AOUT_MAGIC[magic]})"
+        if head.startswith(b"#!"):
+            interp = head[2:].split(b"\n", 1)[0].strip().decode("latin-1")
+            return f"脚本, 解释器 {interp}"
+        if head.startswith(b"\x1f\x8b"):
+            return "gzip 压缩数据"
+        if head.startswith(b"\x1f\x9d"):
+            return "compress 压缩数据"
+        # 文本启发式: 无 NUL 且可打印字符占比高
+        if b"\x00" not in head:
+            printable = sum(1 for b in head if 32 <= b < 127 or b in (9, 10, 13))
+            if printable / len(head) > 0.95:
+                return "ASCII 文本"
+        return "二进制数据"
+
+    def do_file(self, arg: str) -> None:
+        """file <路径>... -- 判断文件类型(目录/设备/a.out/脚本/文本/二进制)"""
+        args = self._args(arg)
+        if not args:
+            self._print("用法: file <路径>...")
+            return
+        for path in args:
+            self._print(f"{path}: {self._classify(self._resolve(path))}")
+
+    def do_dump(self, arg: str) -> None:
+        """dump <路径> [偏移 [长度]] -- 十六进制转储文件内容"""
+        args = self._args(arg)
+        if not 1 <= len(args) <= 3:
+            self._print("用法: dump <路径> [偏移 [长度]]")
+            return
+        inode = self._resolve(args[0])
+        try:
+            offset = int(args[1], 0) if len(args) > 1 else 0
+            length = int(args[2], 0) if len(args) > 2 else None
+        except ValueError:
+            self._print("dump: 偏移/长度必须是整数")
+            return
+        data = self.fs.read_file(inode, offset, length)
+        for pos in range(0, len(data), 16):
+            row = data[pos:pos + 16]
+            hexpart = " ".join(
+                f"{b:02x}" if i < len(row) else "  "
+                for i, b in enumerate(row.ljust(16, b"\x00")))
+            hexpart = hexpart[:23] + " " + hexpart[23:]  # 8 字节分组
+            ascii_part = "".join(chr(b) if 32 <= b < 127 else "." for b in row)
+            self._print(f"{offset + pos:08x}  {hexpart}  |{ascii_part}|")
+        self._print(f"{offset + len(data):08x}")
+
+    def do_less(self, arg: str) -> None:
+        """less <路径> -- 分页查看文本文件, 空格/回车翻页, q 退出"""
+        args = self._args(arg)
+        if len(args) != 1:
+            self._print("用法: less <路径>")
+            return
+        inode = self._resolve(args[0])
+        text = self.fs.read_file(inode).decode("latin-1")
+        lines = text.splitlines()
+        page = self.page_size
+        pos = 0
+        while pos < len(lines):
+            for line in lines[pos:pos + page]:
+                self._print(line)
+            pos += page
+            if pos >= len(lines):
+                break
+            try:
+                key = self.input_fn(f"--更多-- ({min(pos, len(lines))}/{len(lines)} 行) ")
+            except (EOFError, KeyboardInterrupt):
+                self._print()
+                break
+            if key.strip().lower() == "q":
+                break
 
 
 def main(argv=None) -> int:

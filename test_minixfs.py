@@ -393,6 +393,92 @@ class TestShellStatInode(ShellTestCase):
         self.assertIn("用法", self.run_cmd("inode"))
 
 
+class TestShellFileDumpLess(ShellTestCase):
+    def test_file_text(self):
+        self.assertIn("ASCII 文本", self.run_cmd("file hello.txt"))
+
+    def test_file_dir_and_device(self):
+        out = self.run_cmd("file sub tty")
+        self.assertIn("sub: directory", out)
+        self.assertIn("tty: character special file", out)
+
+    def test_file_binary(self):
+        self.assertIn("二进制数据", self.run_cmd("file big.bin"))
+
+    def test_file_aout(self):
+        # 直接构造带 ZMAGIC 头的数据来测判定逻辑
+        fake = self.fs.get_inode(2)
+        orig = self.fs.read_file
+        self.fs.read_file = lambda *a, **k: b"\x0b\x01\x00\x00" + b"\x00" * 28
+        try:
+            self.assertIn("a.out 可执行文件 (ZMAGIC)", self.shell._classify(fake))
+        finally:
+            self.fs.read_file = orig
+
+    def test_file_script(self):
+        fake = self.fs.get_inode(2)
+        orig = self.fs.read_file
+        self.fs.read_file = lambda *a, **k: b"#!/bin/sh\necho hi\n"
+        try:
+            self.assertIn("解释器 /bin/sh", self.shell._classify(fake))
+        finally:
+            self.fs.read_file = orig
+
+    def test_file_no_args(self):
+        self.assertIn("用法", self.run_cmd("file"))
+
+    def test_dump_basic(self):
+        out = self.run_cmd("dump hello.txt")
+        self.assertIn("00000000", out)
+        self.assertIn("48 65 6c 6c 6f 2c 20 4d  69 6e 69 78 21 0a", out)
+        self.assertIn("|Hello, Minix!.|", out)
+        self.assertIn("0000000e", out)  # 结尾偏移
+
+    def test_dump_offset_length(self):
+        out = self.run_cmd("dump hello.txt 7 5")
+        self.assertIn("00000007", out)
+        self.assertIn("|Minix|", out)
+
+    def test_dump_bad_args(self):
+        self.assertIn("用法", self.run_cmd("dump"))
+        self.assertIn("必须是整数", self.run_cmd("dump hello.txt xyz"))
+
+    def test_less_short_file_no_paging(self):
+        out = self.run_cmd("less hello.txt")
+        self.assertEqual(out, "Hello, Minix!\n")
+        self.assertNotIn("--更多--", out)
+
+    def test_less_paging_and_quit(self):
+        import minix_shell
+        # /sub/note.txt 只有一行, 用 big.bin 不合适; 构造多行文本走翻页逻辑
+        orig = self.fs.read_file
+        fake_text = b"\n".join(b"line %d" % i for i in range(10)) + b"\n"
+
+        def fake_read(inode, *a, **k):
+            # 只劫持 hello.txt(inode 2), 目录解析仍走真实读取
+            return fake_text if inode.num == 2 else orig(inode, *a, **k)
+
+        self.fs.read_file = fake_read
+        prompts = []
+
+        def fake_input(prompt):
+            prompts.append(prompt)
+            return "q" if len(prompts) >= 2 else ""
+
+        try:
+            shell = minix_shell.MinixShell(self.fs, page_size=3,
+                                           input_fn=fake_input, stdout=self.out)
+            shell.onecmd("less hello.txt")
+        finally:
+            self.fs.read_file = orig
+        out = self.out.getvalue()
+        self.assertIn("line 0", out)
+        self.assertIn("line 5", out)      # 第二页已输出
+        self.assertNotIn("line 9", out)   # q 之后停止
+        self.assertEqual(len(prompts), 2)
+        self.assertIn("--更多--", prompts[0])
+
+
 @unittest.skipUnless(os.path.exists(IMG_PATH), "真实镜像 hdc-0.11.img 不存在")
 class TestRealImage(unittest.TestCase):
     """针对仓库中 Linux 0.11 真实镜像的集成测试."""
