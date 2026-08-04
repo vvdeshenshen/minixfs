@@ -284,6 +284,138 @@ class TestFileRead(unittest.TestCase):
         self.assertEqual(self.fs.zone_at(ino, 10), 0)   # 未分配 -> 空洞
 
 
+class TestCheckFs(unittest.TestCase):
+    """minixfs.check_fs 一致性检查测试.
+
+    fixture 镜像中 sparse.bin(inode 7) 是全空洞文件, 属于预期内的
+    size/块数不一致, 各测试将其排除后断言注入的损坏被检出.
+    """
+
+    INODE_TABLE = 4 * BLOCK_SIZE
+    IMAP = 2 * BLOCK_SIZE
+    ZMAP = 3 * BLOCK_SIZE
+
+    def check(self, img):
+        fs = MinixFS(io.BytesIO(bytes(img)), offset=0)
+        return minixfs.check_fs(fs)
+
+    def others(self, report):
+        """排除 sparse.bin(inode 7) 的预期空洞问题."""
+        return [p for p in report.problems if p.inode != 7]
+
+    def inode_off(self, num):
+        return self.INODE_TABLE + (num - 1) * 32
+
+    def test_clean_image(self):
+        report = self.check(build_image())
+        self.assertEqual(self.others(report), [])
+        self.assertEqual(report.inodes_checked, 7)
+        # 引用的 zone: 5,6,7,8..14,15(间接块),16,17,18,19 共 15 个
+        self.assertEqual(report.zones_checked, 15)
+        # sparse.bin 的空洞被如实报告
+        sparse = [p for p in report.problems if p.inode == 7]
+        self.assertEqual(len(sparse), 1)
+        self.assertIn("空洞", sparse[0].message)
+        self.assertIn("size 与数据块数不一致", sparse[0].message)
+        self.assertEqual(sparse[0].path, "/sparse.bin")
+
+    def test_size_larger_than_blocks(self):
+        img = bytearray(build_image())
+        # hello.txt(inode 2) size 14 -> 2000, 应占 2 块实际 1 块
+        struct.pack_into("<I", img, self.inode_off(2) + 4, 2000)
+        probs = self.others(self.check(img))
+        self.assertEqual(len(probs), 1)
+        self.assertEqual(probs[0].path, "/hello.txt")
+        self.assertEqual(probs[0].inode, 2)
+        self.assertIn("size=2000 应占 2 块, 实际引用 1 块", probs[0].message)
+
+    def test_block_beyond_eof(self):
+        img = bytearray(build_image())
+        # hello.txt zone[1] 指向 zone 19: 越过 EOF 且与 note.txt 重复
+        struct.pack_into("<H", img, self.inode_off(2) + 14 + 2, 19)
+        probs = self.others(self.check(img))
+        msgs = "\n".join(p.message for p in probs)
+        self.assertIn("越过文件末尾", msgs)
+        self.assertIn("重复引用", msgs)
+
+    def test_inode_not_in_bitmap(self):
+        img = bytearray(build_image())
+        img[self.IMAP] &= ~(1 << 6)  # 清掉 inode 6(note.txt) 的位
+        probs = self.others(self.check(img))
+        self.assertEqual(len(probs), 1)
+        self.assertEqual(probs[0].path, "/sub/note.txt")
+        self.assertEqual(probs[0].inode, 6)
+        self.assertIn("未在 inode 位图中标记为已分配", probs[0].message)
+
+    def test_orphan_inode_with_content(self):
+        img = bytearray(build_image())
+        img[self.IMAP + 1] |= 0x01  # inode 8 置位但无目录引用
+        # 给 inode 8 写入真实内容(mode/nlinks 非零)
+        img[self.inode_off(8):self.inode_off(8) + 32] = _pack_inode(
+            0o100644, 0, 0, 946684800, 0, 1, [])
+        probs = self.others(self.check(img))
+        self.assertEqual(len(probs), 1)
+        self.assertEqual(probs[0].inode, 8)
+        self.assertIn("孤儿 inode", probs[0].message)
+
+    def test_bitmap_leak_zero_inode(self):
+        img = bytearray(build_image())
+        img[self.IMAP + 1] |= 0x01  # inode 8 置位, 但 inode 内容全零
+        probs = self.others(self.check(img))
+        self.assertEqual(len(probs), 1)
+        self.assertEqual(probs[0].inode, 8)
+        self.assertIn("内容全零", probs[0].message)
+
+    def test_zone_not_in_bitmap(self):
+        img = bytearray(build_image())
+        # zone 7(hello.txt 数据块)对应位 3
+        img[self.ZMAP] &= ~(1 << 3)
+        probs = self.others(self.check(img))
+        self.assertEqual(len(probs), 1)
+        self.assertEqual(probs[0].path, "/hello.txt")
+        self.assertIn("zone 7 未在 zone 位图中标记为已用", probs[0].message)
+
+    def test_lost_zone(self):
+        img = bytearray(build_image())
+        img[self.ZMAP + 2] |= 0x01  # 位 16 -> zone 20, 无人引用
+        probs = self.others(self.check(img))
+        self.assertEqual(len(probs), 1)
+        self.assertEqual(probs[0].inode, 0)
+        self.assertIn("丢失块", probs[0].message)
+        self.assertIn("20", probs[0].message)
+
+    def test_duplicate_zone(self):
+        img = bytearray(build_image())
+        # note.txt(inode 6) zone[0]: 19 -> 7, 与 hello.txt 重复; zone 19 变丢失块
+        struct.pack_into("<H", img, self.inode_off(6) + 14, 7)
+        probs = self.others(self.check(img))
+        msgs = "\n".join(p.message for p in probs)
+        self.assertIn("zone 7 与 /hello.txt (inode 2) 重复引用", msgs)
+        self.assertIn("丢失块", msgs)
+
+    def test_illegal_zone_number(self):
+        img = bytearray(build_image())
+        # hello.txt zone[0]: 7 -> 40 (nzones=32, 越界); zone 7 变丢失块
+        struct.pack_into("<H", img, self.inode_off(2) + 14, 40)
+        probs = self.others(self.check(img))
+        msgs = "\n".join(p.message for p in probs)
+        self.assertIn("zone 号非法: 40", msgs)
+        self.assertIn("丢失块", msgs)
+
+    def test_dir_size_not_multiple_of_dirent(self):
+        img = bytearray(build_image())
+        # sub 目录(inode 3) size 48 -> 50
+        struct.pack_into("<I", img, self.inode_off(3) + 4, 50)
+        probs = self.others(self.check(img))
+        msgs = "\n".join(p.message for p in probs)
+        self.assertIn("不是目录项大小 16 的整数倍", msgs)
+
+    def test_problem_str_format(self):
+        report = self.check(build_image())
+        sparse = [p for p in report.problems if p.inode == 7][0]
+        self.assertTrue(str(sparse).startswith("/sparse.bin (inode 7): "))
+
+
 # ---------------------------------------------------------------------------
 # shell 测试
 # ---------------------------------------------------------------------------
@@ -491,6 +623,24 @@ class TestShellFileDumpLess(ShellTestCase):
         self.assertIn("line 3", out)      # f 翻到第二屏
         self.assertNotIn("line 6", out)   # q 之后停止
         self.assertIn("1-3/10 行 (30%)", out)
+
+
+class TestShellCheckfs(ShellTestCase):
+    def test_checkfs_reports_and_summary(self):
+        out = self.run_cmd("checkfs")
+        # fixture 中唯一的预期问题: sparse.bin 的空洞
+        self.assertIn("/sparse.bin (inode 7): size 与数据块数不一致", out)
+        self.assertIn("检查完成: 7 个 inode, 15 个已引用 zone, 发现 1 个问题", out)
+
+    def test_checkfs_zone_allocated_api(self):
+        # 顺带覆盖库层 zone_allocated 公开接口
+        self.assertTrue(self.fs.zone_allocated(5))
+        self.assertTrue(self.fs.zone_allocated(19))
+        self.assertFalse(self.fs.zone_allocated(20))
+        with self.assertRaises(MinixError):
+            self.fs.zone_allocated(4)   # firstdatazone 之前
+        with self.assertRaises(MinixError):
+            self.fs.zone_allocated(32)  # nzones 之外
 
 
 class TestPager(unittest.TestCase):

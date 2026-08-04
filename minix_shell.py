@@ -11,7 +11,7 @@ import cmd
 import shlex
 import sys
 
-from minixfs import Inode, MinixError, MinixFS
+from minixfs import Inode, MinixError, MinixFS, check_fs
 from pager import Pager, read_key_tty
 
 
@@ -199,6 +199,20 @@ class MinixShell(cmd.Cmd):
         self._print(f"  zones = {list(inode.zones[:7])} "
                     f"间接={inode.zones[7]} 二级间接={inode.zones[8]}")
 
+
+    # ---- checkfs --------------------------------------------------------
+
+    def do_checkfs(self, arg: str) -> None:
+        """checkfs -- 全盘一致性检查: size/数据块数, inode 与 zone 的位图标记"""
+        report = check_fs(self.fs)
+        for p in report.problems:
+            self._print(str(p))
+        self._print(f"检查完成: {report.inodes_checked} 个 inode, "
+                    f"{report.zones_checked} 个已引用 zone, "
+                    f"发现 {len(report.problems)} 个问题"
+                    if report.problems else
+                    f"检查完成: {report.inodes_checked} 个 inode, "
+                    f"{report.zones_checked} 个已引用 zone, 未发现问题")
 
     # ---- file / dump / less --------------------------------------------
 

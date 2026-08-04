@@ -286,6 +286,15 @@ class MinixFS:
                                              sb.zmap_blocks, total_zones),
         }
 
+    def zone_allocated(self, zone: int) -> bool:
+        """查 zone 位图判断该数据 zone 是否已分配."""
+        if not self.sb.firstdatazone <= zone < self.sb.nzones:
+            raise MinixError(f"zone 号越界: {zone}")
+        bit = zone - self.sb.firstdatazone + 1
+        bmap = self.read_block(2 + self.sb.imap_blocks + bit // (BLOCK_SIZE * 8))
+        byte = bmap[(bit % (BLOCK_SIZE * 8)) // 8]
+        return bool(byte & (1 << (bit % 8)))
+
     # ---- 数据 zone 映射与文件读取 ------------------------------------
 
     def zone_at(self, inode: Inode, index: int) -> int:
@@ -373,3 +382,205 @@ class MinixFS:
                 raise MinixError(f"路径不存在: '{part}'")
             cur = nxt
         return cur
+
+
+# ---------------------------------------------------------------------------
+# 文件系统一致性检查 (fsck)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class FsckProblem:
+    path: str      # 首次发现该 inode 的路径; 全局性问题为 "-"
+    inode: int     # 相关 inode 号; 全局性问题为 0
+    message: str
+
+    def __str__(self) -> str:
+        if self.inode:
+            return f"{self.path} (inode {self.inode}): {self.message}"
+        return self.message
+
+
+@dataclass
+class FsckReport:
+    problems: List[FsckProblem]
+    inodes_checked: int
+    zones_checked: int
+
+    @property
+    def clean(self) -> bool:
+        return not self.problems
+
+
+def check_fs(fs: MinixFS) -> FsckReport:
+    """遍历全部目录与文件, 做一致性检查.
+
+    检查项:
+      1. 每个 inode 的 size 与实际引用的数据块个数是否一致
+         (含越过文件末尾的数据块与空洞);
+      2. 目录树中引用的 inode 是否都在 inode 位图中标记为已分配,
+         以及位图已分配却未被任何目录引用的孤儿 inode;
+      3. 每个数据块/间接块的 zone 号是否合法, 是否都在 zone 位图中
+         标记为已用, 是否被多个文件重复引用, 以及位图已用却未被
+         任何 inode 引用的丢失块.
+    """
+    sb = fs.sb
+    problems: List[FsckProblem] = []
+
+    # 位图整体读入内存, 避免逐位读盘
+    imap = b"".join(fs.read_block(2 + i) for i in range(sb.imap_blocks))
+    zmap = b"".join(fs.read_block(2 + sb.imap_blocks + i)
+                    for i in range(sb.zmap_blocks))
+
+    def ibit(num: int) -> bool:
+        return bool(imap[num >> 3] & (1 << (num & 7)))
+
+    def zbit(zone: int) -> bool:
+        bit = zone - sb.firstdatazone + 1
+        return bool(zmap[bit >> 3] & (1 << (bit & 7)))
+
+    def collect_zones(inode: Inode):
+        """枚举 inode 引用的所有 zone.
+
+        返回 (data, meta): data 是 [(文件内块索引, zone)], meta 是
+        [(描述, zone)] 的间接块自身. 越界的间接块不再向下展开.
+        """
+        data, meta = [], []
+
+        def valid(z):
+            return sb.firstdatazone <= z < sb.nzones
+
+        for i in range(7):
+            if inode.zones[i]:
+                data.append((i, inode.zones[i]))
+        ind = inode.zones[7]
+        if ind:
+            meta.append(("一级间接块", ind))
+            if valid(ind):
+                for j, z in enumerate(struct.unpack(f"<{ZONES_PER_BLOCK}H",
+                                                    fs.read_block(ind))):
+                    if z:
+                        data.append((7 + j, z))
+        dbl = inode.zones[8]
+        if dbl:
+            meta.append(("二级间接块", dbl))
+            if valid(dbl):
+                for j, z in enumerate(struct.unpack(f"<{ZONES_PER_BLOCK}H",
+                                                    fs.read_block(dbl))):
+                    if not z:
+                        continue
+                    meta.append((f"二级间接的下级块[{j}]", z))
+                    if valid(z):
+                        base = 7 + ZONES_PER_BLOCK + j * ZONES_PER_BLOCK
+                        for k, z2 in enumerate(
+                                struct.unpack(f"<{ZONES_PER_BLOCK}H",
+                                              fs.read_block(z))):
+                            if z2:
+                                data.append((base + k, z2))
+        return data, meta
+
+    zone_owner = {}          # zone -> (path, inode_num)
+    referenced = {}          # inode_num -> 首次引用路径
+    checked = set()          # 已做过内容检查的 inode
+
+    def check_inode(path: str, inode: Inode) -> None:
+        """对单个 inode 做 zone 合法性 / 位图 / size 一致性检查."""
+        if inode.is_device or inode.is_fifo:
+            return  # zones[0] 是设备号, 无数据块
+        data, meta = collect_zones(inode)
+
+        for desc, zone, is_meta in ([(f"数据块[{i}]", z, False) for i, z in data]
+                                    + [(d, z, True) for d, z in meta]):
+            if not sb.firstdatazone <= zone < sb.nzones:
+                problems.append(FsckProblem(
+                    path, inode.num,
+                    f"{desc} zone 号非法: {zone} (有效范围 "
+                    f"{sb.firstdatazone}..{sb.nzones - 1})"))
+                continue
+            if not zbit(zone):
+                problems.append(FsckProblem(
+                    path, inode.num, f"{desc} zone {zone} 未在 zone 位图中标记为已用"))
+            if zone in zone_owner:
+                opath, oino = zone_owner[zone]
+                problems.append(FsckProblem(
+                    path, inode.num,
+                    f"{desc} zone {zone} 与 {opath} (inode {oino}) 重复引用"))
+            else:
+                zone_owner[zone] = (path, inode.num)
+
+        expected = (inode.size + BLOCK_SIZE - 1) // BLOCK_SIZE
+        beyond = [i for i, _ in data if i >= expected]
+        if len(data) != expected or beyond:
+            msg = (f"size 与数据块数不一致: size={inode.size} 应占 "
+                   f"{expected} 块, 实际引用 {len(data)} 块")
+            if beyond:
+                msg += f", 其中 {len(beyond)} 块越过文件末尾"
+            elif len(data) < expected:
+                msg += f" (存在 {expected - len(data)} 个空洞)"
+            problems.append(FsckProblem(path, inode.num, msg))
+
+        if inode.is_dir and inode.size % sb.dirent_size:
+            problems.append(FsckProblem(
+                path, inode.num,
+                f"目录 size {inode.size} 不是目录项大小 {sb.dirent_size} 的整数倍"))
+
+    # ---- 从根开始遍历目录树 ----
+    stack = [("/", ROOT_INODE)]
+    referenced[ROOT_INODE] = "/"
+    while stack:
+        dpath, dnum = stack.pop()
+        dnode = fs.get_inode(dnum)
+        if dnum not in checked:
+            checked.add(dnum)
+            if not ibit(dnum):
+                problems.append(FsckProblem(
+                    dpath, dnum, "inode 未在 inode 位图中标记为已分配"))
+            check_inode(dpath, dnode)
+        for ino, name in fs.read_dir(dnode):
+            epath = (dpath.rstrip("/") + "/" + name) if name not in (".", "..") \
+                else dpath
+            if not 1 <= ino <= sb.ninodes:
+                problems.append(FsckProblem(
+                    epath, ino, f"目录项 '{name}' 的 inode 号越界"))
+                continue
+            referenced.setdefault(ino, epath)
+            if name in (".", ".."):
+                continue
+            child = fs.get_inode(ino)
+            if child.is_dir:
+                if ino not in checked:
+                    stack.append((epath, ino))
+            elif ino not in checked:
+                checked.add(ino)
+                if not ibit(ino):
+                    problems.append(FsckProblem(
+                        epath, ino, "inode 未在 inode 位图中标记为已分配"))
+                if not (child.is_regular or child.is_device or child.is_fifo
+                        or child.is_symlink):
+                    problems.append(FsckProblem(
+                        epath, ino, f"未知的文件类型 mode={child.mode:#06x}"))
+                check_inode(epath, child)
+
+    # ---- 全局反向检查: 孤儿 inode 与丢失 zone ----
+    for i in range(1, sb.ninodes + 1):
+        if ibit(i) and i not in referenced:
+            node = fs.get_inode(i)
+            if node.mode or node.nlinks or node.size:
+                problems.append(FsckProblem(
+                    "-", i, f"inode 在位图中已分配但未被任何目录引用"
+                            f"(孤儿 inode, mode={node.mode:#06x}, "
+                            f"size={node.size}, nlinks={node.nlinks})"))
+            else:
+                problems.append(FsckProblem(
+                    "-", i, "inode 在位图中已分配但内容全零"
+                            "(位图泄漏; 若为最后一个 inode, 多半是老 mkfs "
+                            "位图填充的差一问题)"))
+    lost = [z for z in range(sb.firstdatazone, sb.nzones)
+            if zbit(z) and z not in zone_owner]
+    if lost:
+        head = ", ".join(map(str, lost[:10]))
+        more = f" 等共 {len(lost)} 个" if len(lost) > 10 else ""
+        problems.append(FsckProblem(
+            "-", 0, f"{len(lost)} 个 zone 在位图中已用但未被任何 inode 引用"
+                    f"(丢失块): {head}{more}"))
+
+    return FsckReport(problems, len(checked), len(zone_owner))
