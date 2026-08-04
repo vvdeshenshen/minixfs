@@ -625,6 +625,70 @@ class TestShellFileDumpLess(ShellTestCase):
         self.assertIn("1-3/10 行 (30%)", out)
 
 
+class TestFindReferences(unittest.TestCase):
+    def setUp(self):
+        self.fs = open_test_fs()
+
+    def test_regular_file(self):
+        self.assertEqual(self.fs.find_references(2), [("/", "hello.txt")])
+        self.assertEqual(self.fs.find_references(6), [("/sub", "note.txt")])
+
+    def test_directory_includes_dot_entries(self):
+        # /sub(inode 3): 根目录里的 'sub' + 自身的 '.', 与 nlinks=2 一致
+        self.assertEqual(self.fs.find_references(3),
+                         [("/", "sub"), ("/sub", ".")])
+
+    def test_root_references(self):
+        # 根(inode 1): 自身 './..' + 子目录 /sub 的 '..', 与 nlinks=3 一致
+        self.assertEqual(self.fs.find_references(1),
+                         [("/", "."), ("/", ".."), ("/sub", "..")])
+
+    def test_unreferenced_inode(self):
+        self.assertEqual(self.fs.find_references(8), [])
+
+
+class TestShellInfo(ShellTestCase):
+    def test_info_file(self):
+        out = self.run_cmd("info 2")
+        self.assertIn("inode 2 (已分配)", out)
+        self.assertIn("regular file", out)
+        self.assertIn("引用该 inode 的目录项 (1 个):", out)
+        self.assertIn("  /hello.txt", out)
+        self.assertNotIn("不一致", out)  # nlinks=1 与引用数一致
+
+    def test_info_directory(self):
+        out = self.run_cmd("info 3")
+        self.assertIn("引用该 inode 的目录项 (2 个):", out)
+        self.assertIn("  /sub", out)
+        self.assertIn("  /sub/.", out)
+        self.assertNotIn("不一致", out)  # nlinks=2
+
+    def test_info_root(self):
+        out = self.run_cmd("info 1")
+        self.assertIn("引用该 inode 的目录项 (3 个):", out)
+        self.assertIn("  /.", out)
+        self.assertIn("  /sub/..", out)
+
+    def test_info_unreferenced(self):
+        out = self.run_cmd("info 8")
+        self.assertIn("引用该 inode 的目录项: 无", out)
+
+    def test_info_nlinks_mismatch(self):
+        # 直接改 hello.txt 的 nlinks 为 5, info 应提示不一致
+        img = bytearray(build_image())
+        img[4 * BLOCK_SIZE + 32 + 13] = 5  # inode 2 的 nlinks 字段(偏移 13)
+        import minix_shell
+        fs = MinixFS(io.BytesIO(bytes(img)), offset=0)
+        out = io.StringIO()
+        minix_shell.MinixShell(fs, stdout=out).onecmd("info 2")
+        self.assertIn("nlinks=5 与实际引用数 1 不一致", out.getvalue())
+
+    def test_info_bad_args(self):
+        self.assertIn("用法", self.run_cmd("info"))
+        self.assertIn("无效编号", self.run_cmd("info abc"))
+        self.assertIn("错误", self.run_cmd("info 999"))
+
+
 class TestShellCheckfs(ShellTestCase):
     def test_checkfs_reports_and_summary(self):
         out = self.run_cmd("checkfs")

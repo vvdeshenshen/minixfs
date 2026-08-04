@@ -176,17 +176,19 @@ class MinixShell(cmd.Cmd):
                 self._print()
             self._print_inode_info(self._resolve(path), name=path)
 
-    def do_inode(self, arg: str) -> None:
-        """inode <编号> -- 按编号显示 inode 的原始信息"""
+    def _parse_inode_arg(self, arg: str, usage: str):
+        """解析单个 inode 编号参数, 失败时打印用法并返回 None."""
         args = self._args(arg)
         if len(args) != 1:
-            self._print("用法: inode <编号>")
-            return
+            self._print(usage)
+            return None
         try:
-            num = int(args[0], 0)
+            return int(args[0], 0)
         except ValueError:
-            self._print(f"inode: 无效编号: {args[0]}")
-            return
+            self._print(f"无效编号: {args[0]}")
+            return None
+
+    def _print_inode_raw(self, num: int) -> None:
         inode = self.fs.get_inode(num)
         allocated = self.fs.inode_allocated(num)
         self._print(f"inode {num} ({'已分配' if allocated else '未分配'})")
@@ -198,6 +200,31 @@ class MinixShell(cmd.Cmd):
         self._print(f"  mtime = {inode.mtime} ({inode.mtime_string()})")
         self._print(f"  zones = {list(inode.zones[:7])} "
                     f"间接={inode.zones[7]} 二级间接={inode.zones[8]}")
+
+    def do_inode(self, arg: str) -> None:
+        """inode <编号> -- 按编号显示 inode 的原始信息"""
+        num = self._parse_inode_arg(arg, "用法: inode <编号>")
+        if num is not None:
+            self._print_inode_raw(num)
+
+    def do_info(self, arg: str) -> None:
+        """info <编号> -- 显示 inode 详细信息, 并列出引用它的全部目录项"""
+        num = self._parse_inode_arg(arg, "用法: info <编号>")
+        if num is None:
+            return
+        self._print_inode_raw(num)
+        inode = self.fs.get_inode(num)
+        refs = self.fs.find_references(num)
+        if not refs:
+            self._print("引用该 inode 的目录项: 无")
+        else:
+            self._print(f"引用该 inode 的目录项 ({len(refs)} 个):")
+            for dpath, name in refs:
+                full = dpath.rstrip("/") + "/" + name
+                self._print(f"  {full}")
+        if inode.nlinks != len(refs):
+            self._print(f"注意: nlinks={inode.nlinks} 与实际引用数 "
+                        f"{len(refs)} 不一致")
 
 
     # ---- checkfs --------------------------------------------------------

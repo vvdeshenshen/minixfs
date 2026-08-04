@@ -369,6 +369,28 @@ class MinixFS:
                 return self.get_inode(ino)
         return None
 
+    def find_references(self, target: int) -> List[Tuple[str, str]]:
+        """遍历整个目录树, 找出引用 target inode 的全部目录项.
+
+        返回 [(所在目录路径, 目录项名), ...], 含 "." 与 ".." 项
+        (它们同样计入 nlinks). 结果按路径排序.
+        """
+        results = []
+        stack = [("/", ROOT_INODE)]
+        seen = {ROOT_INODE}
+        while stack:
+            dpath, dnum = stack.pop()
+            for ino, name in self.read_dir(self.get_inode(dnum)):
+                if ino == target:
+                    results.append((dpath, name))
+                if name in (".", "..") or not 1 <= ino <= self.sb.ninodes:
+                    continue
+                child = self.get_inode(ino)
+                if child.is_dir and ino not in seen:
+                    seen.add(ino)
+                    stack.append((dpath.rstrip("/") + "/" + name, ino))
+        return sorted(results)
+
     def resolve(self, path: str, cwd: Optional[Inode] = None) -> Inode:
         """把路径解析为 inode. 绝对路径从根开始, 相对路径从 cwd 开始."""
         cur = self.root if (cwd is None or path.startswith("/")) else cwd
