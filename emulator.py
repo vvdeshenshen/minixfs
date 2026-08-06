@@ -63,11 +63,11 @@ def _preset_overlay(k: Kernel) -> None:
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="Linux 0.11 用户态仿真器")
     ap.add_argument("image", help="磁盘镜像(裸 minix 或带 MBR)")
-    # 默认跑 /bin/sh 而不是 /bin/init: 这个镜像没有 /etc/inittab, init 打不开它
-    # 就直接退出(退出码 1); 即便在覆盖层里合成 inittab, init 的 respawn 循环
-    # 目前也还不能稳定停下。要看完整引导链用 `emulator.py 镜像 /bin/init`。
-    ap.add_argument("program", nargs="?", default="/bin/sh",
-                    help="要运行的程序(默认 /bin/sh; 传 /bin/init 走引导链)")
+    # 不传程序名时走内核 init/main.c 的 init(): 跑 /etc/rc, 再起 login shell。
+    # 注意 Linux 0.11 的 init 是内核里的函数, 不是磁盘上的 /bin/init
+    # (镜像里那个 /bin/init 是后来某个软件包的东西, 不在引导链上)。
+    ap.add_argument("program", nargs="?", default=None,
+                    help="要运行的程序; 省略则走内核 init(): /etc/rc + login shell")
     # REMAINDER: 程序名之后的一切原样透传, 这样 `ls -l` 的 -l 不会被本脚本吃掉
     ap.add_argument("args", nargs=argparse.REMAINDER,
                     help="传给程序的参数(原样透传)")
@@ -91,12 +91,15 @@ def main(argv=None) -> int:
         with open(a.load_overlay, "rb") as f:
             k.fs.import_changes(pickle.load(f))
 
-    argv_list = [a.program.encode()] + [x.encode() for x in a.args]
     try:
-        k.boot(a.program, argv_list)
+        if a.program is None:
+            k.boot_init()               # 内核 init(): /etc/rc -> login shell
+        else:
+            argv_list = [a.program.encode()] + [x.encode() for x in a.args]
+            k.boot(a.program, argv_list)
     except (FsError, ExecError) as e:
         term.restore()
-        print(f"无法运行 {a.program}: {e}", file=sys.stderr)
+        print(f"启动失败: {e}", file=sys.stderr)
         return 1
 
     try:

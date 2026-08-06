@@ -9,18 +9,27 @@
    带终端行规程与写入覆盖层(镜像永不被改动)。
 
 ```bash
-# 交互式 bash —— 镜像里的真实 bash 跑在纯 Python 的 x86 解释器上
+# 完整引导: 内核 init() -> /etc/rc -> login shell
 python3 emulator.py hdc-0.11.img
-
-# 单个程序
+```
+```
+ Ok.                                   <- /etc/rc 跑完
+[/usr/root]# echo hello                <- login shell(PS1 来自 /etc/profile)
+hello
+[/usr/root]# exit
+logout
+child 4 died with code 0000            <- init 的 while(1) 汇报, 同 main.c
+```
+```bash
+# 直接跑单个程序(跳过引导)
 python3 emulator.py hdc-0.11.img /bin/date
 python3 emulator.py hdc-0.11.img /usr/bin/ls -l /etc
 
 # 非交互(可脚本化)
 printf 'echo hi | cat\nexit\n' | python3 emulator.py hdc-0.11.img
 ```
-实测可用: 交互式 bash(回显/退格/管道/重定向)、`date`、`cat`、`ls -l`、`head`、
-`basename`、`id`、shell 内建与 for 循环、`#!` 脚本。仿真器细节见下方
+实测可用: 完整引导链、交互式 bash(回显/退格/管道/重定向)、`date`、`cat`、`ls -l`、
+`head`、`basename`、`id`、shell 内建与 for 循环、`#!` 脚本。仿真器细节见下方
 [Linux 0.11 仿真器](#linux-011-仿真器)一节。
 
 ---
@@ -100,7 +109,7 @@ python3 -m unittest test_minixfs test_cpu86 test_kvfs test_kernel test_ktty
 | `x86mem.py` | 双区平坦地址空间(低区 text+data+bss+堆, 高区栈自动增长), 空洞访问抛 SegFault |
 | `kvfs.py` | inode 级写入覆盖层(COW), **镜像文件永不被修改**; 管道; 设备表 |
 | `kexec.py` | a.out ZMAGIC 加载器 + `#!` shebang + 初始栈构造 |
-| `ksyscall.py` / `kernel.py` | 系统调用表与实现、进程/fd 表、fork/execve/waitpid、信号、调度器 |
+| `ksyscall.py` / `kernel.py` | 系统调用表与实现、进程/fd 表、fork/execve/waitpid、信号、调度器、**内建 init** |
 | `ktty.py` | 终端行规程(回显/退格/^C/^D)、termios ioctl、宿主终端与脚本化终端 |
 
 ### ABI 全部从镜像内部查证
@@ -126,9 +135,13 @@ python3 -m unittest test_minixfs test_cpu86 test_kvfs test_kernel test_ktty
 - **x87 浮点未实现**: 镜像 libc 是软浮点编译的(`fp.o`/`fp-interf.o`), 且 0.11 内核的
   `math_emulate` 本身就只是个发 SIGFPE 的桩, 故暂不需要。遇到 x87 指令会抛出带
   eip 与机器码字节的 `CpuError`。
-- **`/bin/init` 引导链只走到一半**: init 能成功执行 `/etc/rc`(打印 " Ok. "), 但这个
-  镜像没有 `/etc/inittab`, init 打不开它就退出; 即便在覆盖层里合成 inittab,
-  init 的 respawn 循环目前也还不能稳定停下。默认入口因此是 `/bin/sh`。
+- **引导链已实现且照内核原文**: Linux 0.11 的 init **不是磁盘上的程序**, 而是内核
+  `init/main.c` 里的 `init()` 函数在用户态执行 —— 它 open `/dev/tty0`、fork 一个
+  `sh` 以 `/etc/rc` 为 stdin 跑启动脚本, 然后在 `while(1)` 里反复以
+  `argv[0] = "-/bin/sh"`(前导 `-` 使其成为 login shell, 会读 `/etc/profile`)起登录
+  shell 并汇报子进程死亡。仿真器把这段逻辑实现为 Python 层的内核任务(`boot_init`)。
+  镜像里那个 `/bin/init` 是后来某个软件包的东西, 不在 0.11 引导链上, 它要的
+  `/etc/inittab` 这个镜像里也没有。
 
 ## 实现笔记(文件系统)
 

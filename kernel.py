@@ -100,6 +100,7 @@ class Process:
         self.name = ""
         self.restart_syscall = False
         self.sigframes = []      # 每层信号帧是否含 blocked 字段
+        self.kernel_task = False  # True = 内核任务(init), 无用户态 CPU
 
     def alloc_fd(self, start: int = 0) -> int:
         for i in range(start, NR_OPEN):
@@ -142,6 +143,9 @@ class Kernel:
         self.exit_status = 0
         self.trace: List[str] = []
         self.runq: List[int] = []
+        self.init_proc: Optional[Process] = None
+        self._init_state = "done"
+        self._init_child = 0
 
     # ---- 进程创建 -----------------------------------------------------
 
@@ -882,6 +886,134 @@ class Kernel:
         p.alarm_at = self.jiffies + secs * HZ if secs else 0
         return remain
 
+    # ---- 内建 init(内核 init/main.c 的 init() 函数) ---------------------
+
+    def boot_init(self) -> Process:
+        """按内核 init/main.c 的 init() 建立 task 1.
+
+        Linux 0.11 的 init **不是磁盘上的程序**, 而是内核里的 init() 函数在用户态
+        执行(镜像里的 /bin/init 是后来某个软件包的东西, 不在 0.11 引导链上)。原文:
+
+            setup(...); open("/dev/tty0",O_RDWR,0); dup(0); dup(0);
+            if (!(pid=fork())) {                     // 跑 /etc/rc
+                close(0); if (open("/etc/rc",O_RDONLY,0)) _exit(1);
+                execve("/bin/sh", argv_rc, envp_rc); _exit(2);
+            }
+            if (pid>0) while (pid != wait(&i));
+            while (1) {                              // 反复起登录 shell
+                if (!(pid=fork())) {
+                    close(0);close(1);close(2); setsid();
+                    open("/dev/tty0",O_RDWR,0); dup(0); dup(0);
+                    _exit(execve("/bin/sh", argv, envp));
+                }
+                while (1) if (pid == wait(&i)) break;
+                printf("child %d died with code %04x", pid, i); sync();
+            }
+        其中 argv_rc = {"/bin/sh"}, envp_rc = {"HOME=/"};
+        argv = {"-/bin/sh"}(前导 '-' 使其成为 login shell), envp = {"HOME=/usr/root"}。
+
+        这里把 init 实现成 Python 层的内核任务: 不占用户态 CPU, 由调度器在
+        _init_step 里按状态机推进。
+        """
+        p = self._new_process()          # pid 1
+        p.ppid = 0
+        p.name = "init"
+        p.cpu = None                     # 内核任务, 没有用户态 CPU
+        p.kernel_task = True
+        self.init_proc = p
+        self._init_state = "rc"
+        self._init_child = 0
+        self._setup_std_fds(p)           # 等价于 open("/dev/tty0"); dup(0); dup(0)
+        self.current = p
+        return p
+
+    def _spawn(self, path: str, argv: List[bytes], envp: List[bytes],
+               stdin_from: Optional[str] = None,
+               new_session: bool = False) -> int:
+        """替 init 起一个子进程(相当于 fork + 重定向 + execve)."""
+        child = self._new_process()
+        child.ppid = self.init_proc.pid
+        child.name = path
+        v, argv = resolve_exec(self.fs, path, argv, child.cwd, child.root)
+        entry, _ = load_aout(child.mem, self.fs, v)
+        esp = setup_stack(child.mem, argv, envp)
+        child.cpu = CPU(child.mem, on_int=self._on_int, on_fault=self._on_fault)
+        child.cpu.eip = entry
+        child.cpu.regs[4] = esp
+        if new_session:
+            child.leader = True
+            child.session = child.pid
+            child.pgrp = child.pid
+        self._setup_std_fds(child)
+        if stdin_from is not None:
+            # init 跑 rc 时是 close(0) 后 open("/etc/rc") —— 让 sh 从脚本读命令
+            if child.fds[0] is not None:
+                self._release_file(child.fds[0])
+            script = self.fs.walk(stdin_from, child.cwd, child.root)
+            script.open_refs += 1
+            child.fds[0] = OpenFile(script, 0)
+        if self.terminal is not None and new_session:
+            self.terminal.session = child.session
+            self.terminal.pgrp = child.pgrp
+        if child.pid not in self.runq:
+            self.runq.append(child.pid)
+        return child.pid
+
+    def _init_step(self) -> None:
+        """推进内建 init 的状态机(替代 init 的用户态执行)."""
+        if self._init_state == "rc":
+            try:
+                self._init_child = self._spawn(
+                    "/bin/sh", [b"/bin/sh"], [b"HOME=/"], stdin_from="/etc/rc")
+                self._init_state = "wait_rc"
+            except (FsError, ExecError):
+                self._init_state = "shell"       # 没有 /etc/rc 就直接起 shell
+            return
+        if self._init_state in ("wait_rc", "wait_shell"):
+            child = self.procs.get(self._init_child)
+            if child is None or child.state == ZOMBIE:
+                was_shell = self._init_state == "wait_shell"
+                if child is not None:
+                    code = child.exit_code
+                    del self.procs[child.pid]
+                    if was_shell:
+                        self._write_console(
+                            f"\r\nchild {child.pid} died with code {code:04x}\r\n")
+                # 真机上控制台不会 EOF, 所以 init 无限重启 shell 是对的; 但输入是
+                # 管道/脚本时耗尽后再重启只会空转, 此时就地收场。
+                self._init_state = "shell" if (not was_shell or
+                                               self._console_alive()) else "done"
+            return
+        if self._init_state == "shell":
+            # argv[0] 的前导 '-' 让 bash 以 login shell 启动(会读 /etc/profile)
+            try:
+                self._init_child = self._spawn(
+                    "/bin/sh", [b"-/bin/sh"], [b"HOME=/usr/root"],
+                    new_session=True)
+                self._init_state = "wait_shell"
+            except (FsError, ExecError) as e:
+                self._write_console(f"init: 无法启动 /bin/sh: {e}\r\n")
+                self._init_state = "done"
+            return
+
+    def _console_alive(self) -> bool:
+        """控制台还能再提供输入吗?
+
+        交互终端永远算活着(真机上控制台不会 EOF); 管道/脚本输入耗尽后算死。
+        """
+        if self.terminal is None:
+            return False
+        term = self.terminal.term
+        if term.is_tty():
+            return True
+        if getattr(term, "at_eof", False):
+            return False
+        return bool(getattr(term, "pending", None)) or bool(self.terminal.ready)
+
+    def _write_console(self, text: str) -> None:
+        if self.terminal is not None:
+            self.terminal.write(text.encode("latin-1"))
+
     # ---- 调度 ---------------------------------------------------------
 
     def _pump_tty(self) -> None:
@@ -903,7 +1035,7 @@ class Kernel:
             if q is None or q.state == ZOMBIE:
                 continue
             self.runq.append(pid)
-            if q.state == RUNNING:
+            if q.state == RUNNING and not q.kernel_task:
                 return q
         return None
 
@@ -918,9 +1050,13 @@ class Kernel:
             self._check_alarms()
             self._wake_waiters()             # 每轮都查等待条件, 否则两端互等会卡死
             self._deliver_pending()
+            if self._init_state != "done":
+                self._init_step()            # 内建 init 的状态机
             p = self._pick()
             if p is None:
-                if not any(q.state != ZOMBIE for q in self.procs.values()):
+                alive = any(q.state != ZOMBIE and not q.kernel_task
+                            for q in self.procs.values())
+                if not alive and self._init_state == "done":
                     break
                 if self.terminal is not None:
                     self.terminal.pump(0.02)      # 阻塞等输入并喂给行规程

@@ -1158,5 +1158,138 @@ class TestMultiProcessEndToEnd(unittest.TestCase):
         self.assertEqual(term.text, "pipe")
 
 
+class TestBuiltinInit(unittest.TestCase):
+    """内建 init —— 照内核 init/main.c 的 init() 函数.
+
+    Linux 0.11 的 init 是内核里的函数在用户态执行, 不是磁盘上的 /bin/init。
+    这里用迷你镜像 + 手写 a.out 当 /bin/sh, 不依赖真实镜像。
+    """
+
+    def setup_world(self, sh_code=None, rc=b"", inputs=None, tty=True):
+        k, term, fs = make_kernel(inputs=inputs)
+        term._tty = tty
+        # /bin/sh: 把 argv[0] 打印出来, 便于验证 login shell 的前导 '-'
+        code = sh_code if sh_code is not None else (
+            b"\x8b\x6c\x24\x04" +                   # mov ebp,[esp+4]  (argv)
+            b"\x8b\x4d\x00" +                       # mov ecx,[ebp]    (argv[0])
+            b"\xb8" + struct.pack("<I", 4) +        # write(1, argv[0], 9)
+            b"\xbb" + struct.pack("<I", 1) +
+            b"\xba" + struct.pack("<I", 9) +
+            b"\xcd\x80" +
+            b"\xb8" + struct.pack("<I", 1) +        # exit(0)
+            b"\x31\xdb" + b"\xcd\x80")
+        fs.mkdir("/bin", 0o755)
+        v = fs.create("/bin/sh", 0o755)
+        fs.write(v, 0, make_aout(code))
+        fs.mkdir("/etc", 0o755)
+        rcv = fs.create("/etc/rc", 0o644)
+        fs.write(rcv, 0, rc)
+        return k, term, fs
+
+    def test_runs_rc_then_login_shell(self):
+        k, term, fs = self.setup_world(tty=False)
+        k.boot_init()
+        k.run(3_000_000)
+        # 先以 argv[0]="/bin/sh" 跑 rc, 再以 "-/bin/sh" 起 login shell
+        self.assertIn("/bin/sh", term.text)
+        self.assertIn("-/bin/sh", term.text)
+        self.assertLess(term.text.index("/bin/sh"), term.text.index("-/bin/sh"))
+
+    def test_login_shell_argv0_has_leading_dash(self):
+        """argv = {"-/bin/sh"} —— 前导 '-' 让 bash 以 login shell 启动读 profile."""
+        k, term, fs = self.setup_world(tty=False)
+        k.boot_init()
+        k.run(3_000_000)
+        self.assertIn("-/bin/sh", term.text)
+
+    def test_rc_child_gets_script_on_stdin(self):
+        """init 是 close(0) 后 open("/etc/rc") —— sh 从脚本读命令."""
+        k, term, fs = self.setup_world(rc=b"# script\n", tty=False)
+        k.boot_init()
+        k._init_step()                            # 进入 rc 阶段
+        child = k.procs[k._init_child]
+        self.assertIsNotNone(child.fds[0])
+        self.assertEqual(child.fds[0].obj.ino, fs.walk("/etc/rc").ino)
+
+    def test_login_shell_is_session_leader(self):
+        k, term, fs = self.setup_world(tty=False)
+        k.boot_init()
+        k._init_step()                            # rc
+        k.procs[k._init_child].state = kmod.ZOMBIE
+        k._init_step()                            # 收 rc
+        k._init_step()                            # 起 login shell
+        shell = k.procs[k._init_child]
+        self.assertTrue(shell.leader)
+        self.assertEqual(shell.session, shell.pid)
+        self.assertEqual(shell.pgrp, shell.pid)
+
+    def test_init_is_pid_1_and_kernel_task(self):
+        k, term, fs = self.setup_world(tty=False)
+        p = k.boot_init()
+        self.assertEqual(p.pid, 1)
+        self.assertTrue(p.kernel_task)
+        self.assertIsNone(p.cpu)                  # 内核任务不占用户态 CPU
+
+    def test_children_have_init_as_parent(self):
+        k, term, fs = self.setup_world(tty=False)
+        k.boot_init()
+        k._init_step()
+        self.assertEqual(k.procs[k._init_child].ppid, 1)
+
+    def test_reports_child_death(self):
+        """init 的 while(1) 里会 printf("child %d died with code %04x")."""
+        k, term, fs = self.setup_world(tty=True)
+        k.boot_init()
+        k._init_step()                            # rc
+        k.procs[k._init_child].state = kmod.ZOMBIE
+        k._init_step()
+        k._init_step()                            # 起 shell
+        shell_pid = k._init_child
+        k.procs[shell_pid].state = kmod.ZOMBIE
+        k.procs[shell_pid].exit_code = 0x0200
+        k._init_step()                            # 收 shell 并汇报
+        self.assertIn(f"child {shell_pid} died with code 0200", term.text)
+
+    def test_respawns_shell_on_a_tty(self):
+        """真机控制台不会 EOF, 所以 init 应当反复重启 shell."""
+        k, term, fs = self.setup_world(tty=True)
+        k.boot_init()
+        k._init_step()
+        k.procs[k._init_child].state = kmod.ZOMBIE
+        k._init_step()
+        k._init_step()                            # 第一次 shell
+        first = k._init_child
+        k.procs[first].state = kmod.ZOMBIE
+        k._init_step()
+        self.assertEqual(k._init_state, "shell")  # 还要再起
+        k._init_step()
+        self.assertNotEqual(k._init_child, first)
+
+    def test_stops_respawning_when_input_exhausted(self):
+        """输入是管道/脚本时耗尽后不再空转重启."""
+        k, term, fs = self.setup_world(tty=False)
+        k.boot_init()
+        k._init_step()
+        k.procs[k._init_child].state = kmod.ZOMBIE
+        k._init_step()
+        k._init_step()                            # 起 shell
+        k.procs[k._init_child].state = kmod.ZOMBIE
+        k._init_step()
+        self.assertEqual(k._init_state, "done")
+
+    def test_missing_rc_skips_to_shell(self):
+        k, term, fs = self.setup_world(tty=False)
+        fs.unlink("/etc/rc")
+        k.boot_init()
+        k._init_step()
+        self.assertEqual(k._init_state, "shell")  # 没有 rc 就直接起 shell
+
+    def test_console_alive_on_tty_always_true(self):
+        k, term, fs = self.setup_world(tty=True)
+        self.assertTrue(k._console_alive())
+        k, term, fs = self.setup_world(tty=False)
+        self.assertFalse(k._console_alive())
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -24,7 +24,7 @@ python3 minix_shell.py hdc-0.11.img
 # 非交互验证(stdout 非 TTY 时 less 退化为直接输出)
 printf 'ls -l /bin\nexit\n' | python3 minix_shell.py hdc-0.11.img
 
-# 仿真器: 交互式 bash / 单个程序 / 可脚本化
+# 仿真器: 完整引导(内核 init -> /etc/rc -> login shell) / 单个程序 / 可脚本化
 python3 emulator.py hdc-0.11.img
 python3 emulator.py hdc-0.11.img /bin/date
 printf 'echo hi | cat\nexit\n' | python3 emulator.py hdc-0.11.img
@@ -67,6 +67,12 @@ cpu86.py → x86mem.py                              CPU 层不 import minixfs �
 
 ## 仿真器(改代码前必读)
 
+- **init 是内核里的函数, 不是 /bin/init**: Linux 0.11 的引导链是 `init/main.c` 的
+  `init()` 在用户态执行 —— open /dev/tty0 + dup 两次, fork 一个 sh 以 /etc/rc 作
+  stdin, 然后 `while(1)` 反复起 `argv[0]="-/bin/sh"` 的 login shell(前导 `-` 让 bash
+  读 /etc/profile)并汇报子进程死亡。已实现为 `Kernel.boot_init()` + `_init_step()`
+  状态机(内核任务, `kernel_task=True`, 不占用户态 CPU)。镜像里的 `/bin/init` 是
+  后来某软件包的产物, **不在引导链上**, 别再拿它当入口。
 - **ABI 一律从镜像内部查证, 不要凭记忆**: 镜像带着 `/usr/src/linux` 的内核 C 源码
   (`fs/` 18 个 .c, `kernel/` 10 个 .c)与完整 `/usr/include`。查法:
   `fs.read_file(fs.resolve('/usr/src/linux/fs/exec.c'))`。已据此确认: 初始栈布局
