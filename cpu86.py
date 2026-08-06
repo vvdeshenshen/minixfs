@@ -55,6 +55,18 @@ class DivideError(Exception):
     """除零或除法溢出(#DE), 内核层应转为 SIGFPE."""
 
 
+# 执行流跳到这个地址之上视为魔数返回(内核用它兜底信号返回)
+MAGIC_EIP_BASE = 0xFFFF0000
+
+
+class MagicJump(Exception):
+    """执行流跳到魔数地址, 由内核层处理(信号返回)."""
+
+    def __init__(self, eip: int):
+        super().__init__(f"跳转到魔数地址 {eip:#x}")
+        self.eip = eip
+
+
 def _sx8(v: int) -> int:
     """8 位有符号扩展为 Python 整数."""
     return v - 256 if v >= 128 else v
@@ -420,6 +432,9 @@ class CPU:
 
     def step(self) -> None:
         """执行一条指令."""
+        if self.eip >= MAGIC_EIP_BASE:
+            # 执行流落到魔数地址: 内核用它兜底信号返回(restorer 为 0 时)
+            raise MagicJump(self.eip)
         self._insn_start = self.eip
         opsize = 4
         rep = 0                       # 0=无, 0xF3=rep/repe, 0xF2=repne

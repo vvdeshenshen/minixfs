@@ -136,6 +136,24 @@ class SyscallTable:
             NR_GETGROUPS: k.sys_getgroups,
             NR_GETTIMEOFDAY: k.sys_gettimeofday,
             NR_SETHOSTNAME: k.sys_sethostname,
+            # 第二批: 多进程与管道
+            NR_FORK: k.sys_fork,
+            NR_WAITPID: k.sys_waitpid,
+            NR_EXECVE: k.sys_execve,
+            NR_PIPE: k.sys_pipe,
+            NR_DUP2: k.sys_dup2,
+            # 第三批: 信号与会话
+            NR_KILL: k.sys_kill,
+            NR_SIGNAL: k.sys_signal,
+            NR_SIGACTION: k.sys_sigaction,
+            NR_SGETMASK: k.sys_sgetmask,
+            NR_SSETMASK: k.sys_ssetmask,
+            NR_ALARM: k.sys_alarm,
+            NR_PAUSE: k.sys_pause,
+            NR_SETSID: k.sys_setsid,
+            NR_SETPGID: k.sys_setpgid,
+            NR_SETREUID: k.sys_setreuid,
+            NR_SETREGID: k.sys_setregid,
         })
 
     def dispatch(self, proc, nr: int, a: int, b: int, c: int) -> int:

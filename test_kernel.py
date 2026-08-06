@@ -16,7 +16,7 @@ import ktty
 import kvfs
 from kernel import Kernel, NR_OPEN, Exited, OpenFile, Process
 from kexec import AoutHeader, ExecError, load_aout, parse_shebang, setup_stack
-from ksyscall import STAT_FMT, pack_stat
+from ksyscall import STAT_FMT, Blocked, pack_stat
 from kvfs import EBADF, EINVAL, EISDIR, ENOENT, ENOTTY, FsError, OverlayFS
 from minixfs import MinixFS
 from test_minixfs import build_image
@@ -739,6 +739,423 @@ class TestEndToEnd(unittest.TestCase):
             b"\x31\xdb" + b"\xcd\x80")
         k, term, rc = self._run(code)
         self.assertEqual(len(term.out), 1)      # stderr 也落到同一终端
+
+
+class TestForkExecWait(unittest.TestCase):
+    """多进程原语."""
+
+    def setUp(self):
+        self.k, self.term, self.fs = make_kernel()
+        self.p = make_proc(self.k, self.fs)
+        self.p.cpu = kmod.CPU(self.p.mem, on_int=self.k._on_int,
+                              on_fault=self.k._on_fault)
+        self.p.cpu.regs[4] = TASK_SIZE - 64
+
+    def fork(self):
+        return self.k.syscalls.dispatch(self.p, ksyscall.NR_FORK, 0, 0, 0)
+
+    def test_fork_returns_child_pid_to_parent(self):
+        pid = self.fork()
+        self.assertGreater(pid, self.p.pid)
+        child = self.k.procs[pid]
+        self.assertEqual(child.ppid, self.p.pid)
+        self.assertEqual(child.cpu.regs[0], 0)        # 子进程返回 0
+
+    def test_fork_memory_is_independent(self):
+        self.p.mem.write_u32(0x1000, 0xAAAA)
+        pid = self.fork()
+        child = self.k.procs[pid]
+        child.mem.write_u32(0x1000, 0xBBBB)
+        self.assertEqual(self.p.mem.read_u32(0x1000), 0xAAAA)
+        self.assertEqual(child.mem.read_u32(0x1000), 0xBBBB)
+
+    def test_fork_shares_file_position(self):
+        """fork 后共享 OpenFile, 故共享读写位置 —— `sh > file` 的语义基础."""
+        path = put_str(self.p, 0x2800, b"/hello.txt")
+        fd = self.k.syscalls.dispatch(self.p, ksyscall.NR_OPEN, path, 0, 0)
+        self.k.syscalls.dispatch(self.p, ksyscall.NR_READ, fd, 0x2000, 7)
+        pid = self.fork()
+        child = self.k.procs[pid]
+        self.assertIs(child.fds[fd], self.p.fds[fd])
+        n = self.k.syscalls.dispatch(child, ksyscall.NR_READ, fd, 0x2000, 5)
+        self.assertEqual(child.mem.read(0x2000, n), b"Minix")   # 接着父进程读
+
+    def test_fork_inherits_cwd_and_umask(self):
+        self.p.umask = 0o077
+        self.p.cwd = self.fs.walk("/sub")
+        child = self.k.procs[self.fork()]
+        self.assertEqual(child.umask, 0o077)
+        self.assertIs(child.cwd, self.p.cwd)
+
+    def test_waitpid_reaps_zombie_and_gives_status(self):
+        pid = self.fork()
+        child = self.k.procs[pid]
+        self.k._exit_process(child, 5 << 8)
+        r = self.k.syscalls.dispatch(self.p, ksyscall.NR_WAITPID,
+                                     pid, 0x2000, 0)
+        self.assertEqual(r, pid)
+        self.assertEqual(self.p.mem.read_u32(0x2000), 5 << 8)
+        self.assertNotIn(pid, self.k.procs)       # 僵尸已回收
+
+    def test_waitpid_no_children_is_echild(self):
+        r = self.k.syscalls.dispatch(self.p, ksyscall.NR_WAITPID, -1, 0, 0)
+        self.assertEqual(r, -kvfs.ECHILD)
+
+    def test_waitpid_wnohang_returns_zero(self):
+        self.fork()
+        r = self.k.syscalls.dispatch(self.p, ksyscall.NR_WAITPID, -1, 0, 1)
+        self.assertEqual(r, 0)
+
+    def test_waitpid_blocks_when_child_alive(self):
+        self.fork()
+        with self.assertRaises(Blocked):
+            self.k.syscalls.dispatch(self.p, ksyscall.NR_WAITPID, -1, 0, 0)
+
+    def test_orphans_reparent_to_init(self):
+        pid = self.fork()
+        child = self.k.procs[pid]
+        gpid = self.k.syscalls.dispatch(child, ksyscall.NR_FORK, 0, 0, 0)
+        self.k._exit_process(child, 0)
+        self.assertEqual(self.k.procs[gpid].ppid, 1)
+
+    def test_exit_status_encoding(self):
+        """正常退出是 code<<8, 被信号杀是 signr."""
+        pid = self.fork()
+        self.k._exit_process(self.k.procs[pid], 3 << 8)
+        self.k.syscalls.dispatch(self.p, ksyscall.NR_WAITPID, pid, 0x2000, 0)
+        self.assertEqual(self.p.mem.read_u32(0x2000) >> 8, 3)
+
+
+class TestPipeSyscall(unittest.TestCase):
+    def setUp(self):
+        self.k, self.term, self.fs = make_kernel()
+        self.p = make_proc(self.k, self.fs)
+
+    def make_pipe(self):
+        self.k.syscalls.dispatch(self.p, ksyscall.NR_PIPE, 0x2100, 0, 0)
+        return (self.p.mem.read_u32(0x2100), self.p.mem.read_u32(0x2104))
+
+    def test_pipe_returns_two_fds(self):
+        r, w = self.make_pipe()
+        self.assertNotEqual(r, w)
+        self.assertIsInstance(self.p.fds[r].obj, kvfs.Pipe)
+        self.assertIs(self.p.fds[r].obj, self.p.fds[w].obj)
+
+    def test_write_then_read_through_pipe(self):
+        r, w = self.make_pipe()
+        self.p.mem.write(0x2000, b"data")
+        self.assertEqual(self.k.syscalls.dispatch(
+            self.p, ksyscall.NR_WRITE, w, 0x2000, 4), 4)
+        n = self.k.syscalls.dispatch(self.p, ksyscall.NR_READ, r, 0x2200, 10)
+        self.assertEqual(self.p.mem.read(0x2200, n), b"data")
+
+    def test_read_empty_pipe_blocks(self):
+        r, w = self.make_pipe()
+        with self.assertRaises(Blocked) as ctx:
+            self.k.syscalls.dispatch(self.p, ksyscall.NR_READ, r, 0x2200, 10)
+        self.assertEqual(ctx.exception.channel[0], "piperead")
+
+    def test_read_after_all_writers_closed_is_eof(self):
+        r, w = self.make_pipe()
+        self.k.syscalls.dispatch(self.p, ksyscall.NR_CLOSE, w, 0, 0)
+        self.assertEqual(self.k.syscalls.dispatch(
+            self.p, ksyscall.NR_READ, r, 0x2200, 10), 0)
+
+    def test_pipe_counts_track_descriptors_not_openfiles(self):
+        """fork 出来的描述符共享 OpenFile, 但管道端计数必须按描述符算,
+        否则父进程 close 后写端永远关不掉, 读端等不到 EOF(真实死锁场景)."""
+        r, w = self.make_pipe()
+        pipe = self.p.fds[r].obj
+        self.assertEqual((pipe.readers, pipe.writers), (1, 1))
+        self.p.cpu = kmod.CPU(self.p.mem, on_int=self.k._on_int,
+                              on_fault=self.k._on_fault)
+        self.p.cpu.regs[4] = TASK_SIZE - 64
+        cpid = self.k.syscalls.dispatch(self.p, ksyscall.NR_FORK, 0, 0, 0)
+        self.assertEqual((pipe.readers, pipe.writers), (2, 2))
+        child = self.k.procs[cpid]
+        # 父进程关掉两端, 子进程仍持有
+        self.k.syscalls.dispatch(self.p, ksyscall.NR_CLOSE, r, 0, 0)
+        self.k.syscalls.dispatch(self.p, ksyscall.NR_CLOSE, w, 0, 0)
+        self.assertEqual((pipe.readers, pipe.writers), (1, 1))
+        # 子进程关写端后, 读端才该见到 EOF
+        self.k.syscalls.dispatch(child, ksyscall.NR_CLOSE, w, 0, 0)
+        self.assertEqual(pipe.writers, 0)
+        self.assertEqual(self.k.syscalls.dispatch(
+            child, ksyscall.NR_READ, r, 0x2200, 10), 0)
+
+    def test_dup_increments_pipe_count(self):
+        r, w = self.make_pipe()
+        pipe = self.p.fds[w].obj
+        self.k.syscalls.dispatch(self.p, ksyscall.NR_DUP, w, 0, 0)
+        self.assertEqual(pipe.writers, 2)
+
+    def test_lseek_on_pipe_is_espipe(self):
+        r, w = self.make_pipe()
+        self.assertEqual(self.k.syscalls.dispatch(
+            self.p, ksyscall.NR_LSEEK, r, 0, 0), -kvfs.ESPIPE)
+
+
+class TestSignals(unittest.TestCase):
+    def setUp(self):
+        self.k, self.term, self.fs = make_kernel()
+        self.p = make_proc(self.k, self.fs)
+        self.p.cpu = kmod.CPU(self.p.mem, on_int=self.k._on_int,
+                              on_fault=self.k._on_fault)
+        self.p.cpu.regs[4] = TASK_SIZE - 256
+
+    def test_signal_registers_handler_and_returns_old(self):
+        r = self.k.syscalls.dispatch(self.p, ksyscall.NR_SIGNAL, 2, 0x1234, 0x5678)
+        self.assertEqual(r, 0)
+        self.assertEqual(self.p.sigactions[2][0], 0x1234)
+        self.assertEqual(self.p.sigactions[2][3], 0x5678)   # restorer
+        r2 = self.k.syscalls.dispatch(self.p, ksyscall.NR_SIGNAL, 2, 1, 0)
+        self.assertEqual(r2, 0x1234)                        # 返回旧 handler
+
+    def test_signal_on_sigkill_rejected(self):
+        self.assertEqual(self.k.syscalls.dispatch(
+            self.p, ksyscall.NR_SIGNAL, kmod.SIGKILL, 0x100, 0), -EINVAL)
+
+    def test_sgetmask_ssetmask(self):
+        old = self.k.syscalls.dispatch(self.p, ksyscall.NR_SSETMASK, 0xF0, 0, 0)
+        self.assertEqual(old, 0)
+        self.assertEqual(self.k.syscalls.dispatch(
+            self.p, ksyscall.NR_SGETMASK, 0, 0, 0), 0xF0)
+
+    def test_ssetmask_cannot_block_sigkill(self):
+        self.k.syscalls.dispatch(self.p, ksyscall.NR_SSETMASK, 0xFFFFFFFF, 0, 0)
+        self.assertEqual(self.p.blocked & (1 << (kmod.SIGKILL - 1)), 0)
+
+    def test_signal_frame_layout(self):
+        """帧布局照内核 kernel/signal.c 的 do_signal 逐字断言."""
+        self.p.sigactions[kmod.SIGINT] = (0x9000, 0x0, 0, 0xAB00)
+        self.p.blocked = 0x55
+        cpu = self.p.cpu
+        cpu.eip = 0x1234
+        cpu.regs[0], cpu.regs[1], cpu.regs[2] = 0xAA, 0xBB, 0xCC
+        flags = cpu.eflags
+        self.k._build_signal_frame(self.p, kmod.SIGINT)
+        self.assertEqual(cpu.eip, 0x9000)                # 跳到 handler
+        sp = cpu.regs[4]
+        got = [cpu.mem.read_u32(sp + 4 * i) for i in range(8)]
+        self.assertEqual(got, [0xAB00,      # sa_restorer(handler 的返回地址)
+                               kmod.SIGINT,  # signr(handler 的参数)
+                               0x55,         # blocked(非 SA_NOMASK 才有)
+                               0xAA, 0xBB, 0xCC,   # eax ecx edx
+                               flags, 0x1234])     # eflags, old_eip
+
+    def test_signal_frame_without_mask_when_nomask(self):
+        self.p.sigactions[kmod.SIGINT] = (0x9000, 0, kmod.SA_NOMASK, 0xAB00)
+        cpu = self.p.cpu
+        cpu.eip = 0x1234
+        self.k._build_signal_frame(self.p, kmod.SIGINT)
+        sp = cpu.regs[4]
+        # SA_NOMASK: 只有 7 个长字, 第 3 个直接是 eax 而不是 blocked
+        self.assertEqual(cpu.mem.read_u32(sp), 0xAB00)
+        self.assertEqual(cpu.mem.read_u32(sp + 4), kmod.SIGINT)
+        self.assertEqual(cpu.mem.read_u32(sp + 24), 0x1234)   # 第 7 个长字
+
+    def test_oneshot_resets_handler(self):
+        self.p.sigactions[kmod.SIGINT] = (0x9000, 0, kmod.SA_ONESHOT, 0)
+        self.k._build_signal_frame(self.p, kmod.SIGINT)
+        self.assertEqual(self.p.sigactions[kmod.SIGINT][0], 0)   # 复位 SIG_DFL
+
+    def test_magic_sigreturn_restores_context(self):
+        """restorer 为 0 时的兜底: 跳魔数地址 -> 内核弹帧恢复现场."""
+        self.p.sigactions[kmod.SIGINT] = (0x9000, 0, 0, 0)
+        cpu = self.p.cpu
+        cpu.eip = 0x1234
+        cpu.regs[0], cpu.regs[1], cpu.regs[2] = 1, 2, 3
+        self.p.blocked = 0x11
+        self.k._build_signal_frame(self.p, kmod.SIGINT)
+        cpu.pop32()                          # 模拟 handler 的 ret 弹掉 restorer
+        self.k._sigreturn(self.p)
+        self.assertEqual(cpu.eip, 0x1234)
+        self.assertEqual([cpu.regs[0], cpu.regs[1], cpu.regs[2]], [1, 2, 3])
+        self.assertEqual(self.p.blocked, 0x11)
+
+    def test_kill_posts_signal(self):
+        self.assertEqual(self.k.syscalls.dispatch(
+            self.p, ksyscall.NR_KILL, self.p.pid, kmod.SIGTERM, 0), 0)
+        self.assertTrue(self.p.signal & (1 << (kmod.SIGTERM - 1)))
+
+    def test_kill_signal_zero_probes_only(self):
+        self.assertEqual(self.k.syscalls.dispatch(
+            self.p, ksyscall.NR_KILL, self.p.pid, 0, 0), 0)
+        self.assertEqual(self.p.signal, 0)
+
+    def test_kill_nonexistent_is_esrch(self):
+        self.assertEqual(self.k.syscalls.dispatch(
+            self.p, ksyscall.NR_KILL, 999, kmod.SIGTERM, 0), -kvfs.ESRCH)
+
+    def test_default_action_terminates(self):
+        self.k._take_signal(self.p, kmod.SIGTERM)
+        self.assertEqual(self.p.state, kmod.ZOMBIE)
+
+    def test_sigchld_ignored_by_default(self):
+        self.k._take_signal(self.p, kmod.SIGCHLD)
+        self.assertEqual(self.p.state, kmod.RUNNING)
+
+    def test_stop_signal_stops_process(self):
+        self.k._take_signal(self.p, kmod.SIGTSTP)
+        self.assertEqual(self.p.state, kmod.STOPPED)
+
+    def test_sig_ign_does_nothing(self):
+        self.p.sigactions[kmod.SIGTERM] = (1, 0, 0, 0)      # SIG_IGN
+        self.k._take_signal(self.p, kmod.SIGTERM)
+        self.assertEqual(self.p.state, kmod.RUNNING)
+
+    def test_lowest_numbered_signal_delivered_first(self):
+        """与内核 ret_from_sys_call 里 bsfl 取最低置位一致."""
+        self.p.sigactions[kmod.SIGINT] = (0x9000, 0, 0, 0x100)
+        self.p.sigactions[kmod.SIGTERM] = (0x9100, 0, 0, 0x100)
+        self.p.signal = (1 << (kmod.SIGTERM - 1)) | (1 << (kmod.SIGINT - 1))
+        self.k._deliver_pending()
+        self.assertEqual(self.p.cpu.eip, 0x9000)        # SIGINT(2) 先于 SIGTERM(15)
+
+    def test_blocked_signal_not_delivered(self):
+        self.p.sigactions[kmod.SIGINT] = (0x9000, 0, 0, 0)
+        self.p.blocked = 1 << (kmod.SIGINT - 1)
+        self.p.signal = 1 << (kmod.SIGINT - 1)
+        self.k._deliver_pending()
+        self.assertNotEqual(self.p.cpu.eip, 0x9000)
+        self.assertTrue(self.p.signal)                  # 仍挂着, 解除屏蔽后再投
+
+    def test_alarm_returns_remaining(self):
+        self.assertEqual(self.k.syscalls.dispatch(
+            self.p, ksyscall.NR_ALARM, 10, 0, 0), 0)
+        self.assertGreater(self.p.alarm_at, 0)
+        r = self.k.syscalls.dispatch(self.p, ksyscall.NR_ALARM, 0, 0, 0)
+        self.assertEqual(r, 10)
+        self.assertEqual(self.p.alarm_at, 0)
+
+    def test_alarm_fires_sigalrm(self):
+        self.k.syscalls.dispatch(self.p, ksyscall.NR_ALARM, 1, 0, 0)
+        self.k.jiffies = self.p.alarm_at
+        self.k._check_alarms()
+        self.assertTrue(self.p.signal & (1 << (kmod.SIGALRM - 1)))
+
+    def test_pause_blocks(self):
+        with self.assertRaises(Blocked):
+            self.k.syscalls.dispatch(self.p, ksyscall.NR_PAUSE, 0, 0, 0)
+
+    def test_setsid_makes_session_leader(self):
+        r = self.k.syscalls.dispatch(self.p, ksyscall.NR_SETSID, 0, 0, 0)
+        self.assertEqual(r, self.p.pid)
+        self.assertTrue(self.p.leader)
+        self.assertEqual(self.k.syscalls.dispatch(
+            self.p, ksyscall.NR_SETSID, 0, 0, 0), -kvfs.EPERM)
+
+    def test_setpgid(self):
+        self.assertEqual(self.k.syscalls.dispatch(
+            self.p, ksyscall.NR_SETPGID, 0, 42, 0), 0)
+        self.assertEqual(self.p.pgrp, 42)
+
+    def test_sigaction_roundtrip(self):
+        vals = (0x1111, 0x2222, 0x3333, 0x4444)
+        for i, v in enumerate(vals):
+            self.p.mem.write_u32(0x2300 + 4 * i, v)
+        self.k.syscalls.dispatch(self.p, ksyscall.NR_SIGACTION, 3, 0x2300, 0)
+        self.assertEqual(self.p.sigactions[3], vals)
+        self.k.syscalls.dispatch(self.p, ksyscall.NR_SIGACTION, 3, 0, 0x2400)
+        got = tuple(self.p.mem.read_u32(0x2400 + 4 * i) for i in range(4))
+        self.assertEqual(got, vals)
+
+
+class TestMultiProcessEndToEnd(unittest.TestCase):
+    """手写 a.out 走 fork/exec/管道全链路, 不依赖真实镜像."""
+
+    def _install(self, fs, path, code):
+        v = fs.create(path, 0o755)
+        fs.write(v, 0, make_aout(code))
+        return v
+
+    def test_fork_and_wait(self):
+        """父进程 fork, 子进程写 C 后退出, 父进程 waitpid 再写 P."""
+        child = (                                    # write(1,[100],1); exit(0)
+            b"\xb8" + struct.pack("<I", 4) +
+            b"\xbb" + struct.pack("<I", 1) +
+            b"\xb9" + struct.pack("<I", 100) +
+            b"\xba" + struct.pack("<I", 1) +
+            b"\xcd\x80" +
+            b"\xb8" + struct.pack("<I", 1) + b"\x31\xdb" + b"\xcd\x80")
+        parent = (                       # waitpid(-1,0,0); write(1,[101],1); exit
+            b"\xb8" + struct.pack("<I", 7) +
+            b"\xbb" + struct.pack("<I", 0xFFFFFFFF) +
+            b"\x31\xc9" + b"\x31\xd2" + b"\xcd\x80" +
+            b"\xb8" + struct.pack("<I", 4) +
+            b"\xbb" + struct.pack("<I", 1) +
+            b"\xb9" + struct.pack("<I", 101) +
+            b"\xba" + struct.pack("<I", 1) +
+            b"\xcd\x80" +
+            b"\xb8" + struct.pack("<I", 1) + b"\x31\xdb" + b"\xcd\x80")
+        code = (
+            b"\xb8" + struct.pack("<I", 2) + b"\xcd\x80" +      # fork
+            b"\x85\xc0" +                                       # test eax,eax
+            b"\x75" + bytes([len(child)]) +                      # jnz -> parent
+            child + parent)
+        k, term, fs = make_kernel()
+        v = self._install(fs, "/prog", code)
+        k.boot("/prog", [b"/prog"])
+        k.current.mem.write(100, b"CP")     # 100='C', 101='P'
+        k.run(2_000_000)
+        # 子进程先写 C, 父进程 wait 到之后写 P
+        self.assertEqual(term.text, "CP")
+
+    def test_execve_replaces_image(self):
+        k, term, fs = make_kernel()
+        self._install(fs, "/target", hello_program(b"target!\n"))
+        path_addr = 0x3400
+        code = (
+            b"\xb8" + struct.pack("<I", 11) +      # execve
+            b"\xbb" + struct.pack("<I", path_addr) +
+            b"\x31\xc9" + b"\x31\xd2" + b"\xcd\x80" +
+            # execve 成功就不会执行到这里
+            b"\xb8" + struct.pack("<I", 1) +
+            b"\xbb" + struct.pack("<I", 9) + b"\xcd\x80")
+        self._install(fs, "/prog", code)
+        k.boot("/prog", [b"/prog"])
+        k.current.mem.write(path_addr, b"/target\x00")
+        rc = k.run(2_000_000)
+        self.assertEqual(term.text, "target!\r\n")
+        self.assertEqual(rc, 0)               # 不是 9, 说明 execve 真的换了镜像
+
+    def test_pipe_between_parent_and_child(self):
+        """父进程写管道, 子进程读出来打印."""
+        child = (             # read(rfd, 0x1300, 8); write(1, 0x1300, eax); exit
+            b"\x8b\x1d" + struct.pack("<I", 0x1200) +  # mov ebx,[fds+0] (rfd)
+            b"\xb8" + struct.pack("<I", 3) +
+            b"\xb9" + struct.pack("<I", 0x1300) +
+            b"\xba" + struct.pack("<I", 8) +
+            b"\xcd\x80" +
+            b"\x89\xc2" +                              # mov edx, eax
+            b"\xb8" + struct.pack("<I", 4) +
+            b"\xbb" + struct.pack("<I", 1) +
+            b"\xcd\x80" +
+            b"\xb8" + struct.pack("<I", 1) + b"\x31\xdb" + b"\xcd\x80")
+        parent = (            # write(wfd,"pipe",4); close(wfd); waitpid; exit
+            b"\x8b\x1d" + struct.pack("<I", 0x1204) +  # mov ebx,[fds+4] (wfd)
+            b"\xb8" + struct.pack("<I", 4) +
+            b"\xb9" + struct.pack("<I", 0x1400) +
+            b"\xba" + struct.pack("<I", 4) +
+            b"\xcd\x80" +
+            b"\xb8" + struct.pack("<I", 6) + b"\xcd\x80" +      # close(wfd)
+            b"\xb8" + struct.pack("<I", 7) +
+            b"\xbb" + struct.pack("<I", 0xFFFFFFFF) +
+            b"\x31\xc9" + b"\x31\xd2" + b"\xcd\x80" +
+            b"\xb8" + struct.pack("<I", 1) + b"\x31\xdb" + b"\xcd\x80")
+        code = (
+            b"\xb8" + struct.pack("<I", 42) +          # pipe(&fds)
+            b"\xbb" + struct.pack("<I", 0x1200) +
+            b"\xcd\x80" +
+            b"\xb8" + struct.pack("<I", 2) + b"\xcd\x80" +      # fork
+            b"\x85\xc0" + b"\x75" + bytes([len(child)]) +        # jnz -> parent
+            child + parent)
+        k, term, fs = make_kernel()
+        self._install(fs, "/prog", code)
+        k.boot("/prog", [b"/prog"])
+        k.current.mem.write(0x1400, b"pipe")
+        k.run(3_000_000)
+        self.assertEqual(term.text, "pipe")
 
 
 if __name__ == "__main__":

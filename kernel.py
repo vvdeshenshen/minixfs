@@ -16,7 +16,7 @@ from typing import Dict, List, Optional
 
 import ksyscall
 import kvfs
-from cpu86 import CPU, DivideError
+from cpu86 import CPU, DivideError, MagicJump
 from kexec import ExecError, load_aout, resolve_exec, setup_stack
 from ksyscall import (SEEK_CUR, SEEK_END, SEEK_SET, UTSNAME_FIELDS, Blocked,
                       SyscallTable, pack_stat)
@@ -32,6 +32,20 @@ TIMESLICE = 100_000       # 一个时间片的指令数, 约折算 10ms
 
 # 进程状态
 RUNNING, SLEEPING, ZOMBIE, STOPPED = range(4)
+
+# 信号(镜像 /usr/include/signal.h)
+SIGHUP, SIGINT, SIGQUIT, SIGILL, SIGTRAP, SIGABRT, SIGUNUSED, SIGFPE = range(1, 9)
+SIGKILL, SIGUSR1, SIGSEGV, SIGUSR2, SIGPIPE, SIGALRM, SIGTERM = range(9, 16)
+SIGSTKFLT, SIGCHLD, SIGCONT, SIGSTOP, SIGTSTP, SIGTTIN, SIGTTOU = range(16, 23)
+
+SA_NOMASK = 0x40000000
+SA_ONESHOT = 0x80000000
+
+IGNORED_BY_DEFAULT = frozenset((SIGCHLD, SIGCONT))
+STOP_SIGNALS = frozenset((SIGSTOP, SIGTSTP, SIGTTIN, SIGTTOU))
+
+# restorer 为 0 时的兜底: 跳到这个魔数地址即表示信号返回, 由内核手动弹帧
+MAGIC_SIGRETURN = 0xFFFF0000
 
 
 class OpenFile:
@@ -84,6 +98,8 @@ class Process:
         self.utime = self.stime = 0
         self.cutime = self.cstime = 0
         self.name = ""
+        self.restart_syscall = False
+        self.sigframes = []      # 每层信号帧是否含 blocked 字段
 
     def alloc_fd(self, start: int = 0) -> int:
         for i in range(start, NR_OPEN):
@@ -105,6 +121,10 @@ class Exited(Exception):
         self.code = code
 
 
+class Replaced(Exception):
+    """execve 换掉了地址空间与 CPU, 必须打断当前(已失效的)cpu.run() 循环."""
+
+
 class Kernel:
     """仿真内核."""
 
@@ -121,6 +141,7 @@ class Kernel:
         self.current: Optional[Process] = None
         self.exit_status = 0
         self.trace: List[str] = []
+        self.runq: List[int] = []
 
     # ---- 进程创建 -----------------------------------------------------
 
@@ -243,6 +264,24 @@ class Kernel:
         if p.euid == 0:
             p.uid = p.suid = uid
         p.euid = uid
+        return 0
+
+    def sys_setreuid(self, p, ruid, euid, c):
+        if ruid != 0xFFFFFFFF:
+            r = self.sys_setuid(p, ruid, 0, 0)
+            if r < 0:
+                return r
+        if euid != 0xFFFFFFFF:
+            p.euid = euid
+        return 0
+
+    def sys_setregid(self, p, rgid, egid, c):
+        if rgid != 0xFFFFFFFF:
+            r = self.sys_setgid(p, rgid, 0, 0)
+            if r < 0:
+                return r
+        if egid != 0xFFFFFFFF:
+            p.egid = egid
         return 0
 
     def sys_setgid(self, p, gid, b, c):
@@ -482,15 +521,13 @@ class Kernel:
     def sys_close(self, p, fd, b, c):
         f = p.get_file(fd)
         p.fds[fd] = None
-        f.refs -= 1
-        if f.refs <= 0 and isinstance(f.obj, VInode):
-            f.obj.open_refs = max(f.obj.open_refs - 1, 0)
+        self._release_file(f)
         return 0
 
     def sys_dup(self, p, fd, b, c):
         f = p.get_file(fd)
         new = p.alloc_fd()
-        f.refs += 1
+        self._acquire_fd(f)
         p.fds[new] = f
         return new
 
@@ -502,7 +539,7 @@ class Kernel:
             return newfd
         if p.fds[newfd] is not None:
             self.sys_close(p, newfd, 0, 0)
-        f.refs += 1
+        self._acquire_fd(f)
         p.fds[newfd] = f
         p.close_on_exec &= ~(1 << newfd)
         return newfd
@@ -511,7 +548,7 @@ class Kernel:
         f = p.get_file(fd)
         if cmd == 0:                                    # F_DUPFD
             new = p.alloc_fd(arg)
-            f.refs += 1
+            self._acquire_fd(f)
             p.fds[new] = f
             return new
         if cmd == 1:                                    # F_GETFD
@@ -545,7 +582,7 @@ class Kernel:
         if isinstance(obj, Pipe):
             data = obj.read(count)
             if data is None:
-                raise Blocked(obj)
+                raise Blocked(("piperead", obj))
             p.mem.write(buf, data)
             return len(data)
         if isinstance(obj, NullDevice):
@@ -571,7 +608,7 @@ class Kernel:
         if isinstance(obj, Pipe):
             n = obj.write(data)
             if n is None:
-                raise Blocked(obj)
+                raise Blocked(("pipewrite", obj))
             return n
         if isinstance(obj, NullDevice):
             return count
@@ -627,27 +664,434 @@ class Kernel:
         # 信号处置复位为 SIG_DFL, 但 SIG_IGN 保留
         p.sigactions = [(0, 0, 0, 0) if h != 1 else (1, 0, 0, 0)
                         for (h, m, fl, r) in p.sigactions]
+        p.sigframes.clear()
+        # 旧 CPU 的 run() 循环还在栈上, 且它持有已失效的内存, 必须打断
+        raise Replaced()
+
+    # ---- fork / execve / waitpid --------------------------------------
+
+    def sys_fork(self, p, a, b, c):
+        child = Process(self.next_pid, p.mem.clone())
+        self.next_pid += 1
+        child.ppid = p.pid
+        child.pgrp = p.pgrp
+        child.session = p.session
+        child.cwd = p.cwd
+        child.root = p.root
+        child.umask = p.umask
+        child.uid, child.euid, child.suid = p.uid, p.euid, p.suid
+        child.gid, child.egid, child.sgid = p.gid, p.egid, p.sgid
+        child.blocked = p.blocked
+        child.sigactions = list(p.sigactions)
+        child.tty = p.tty
+        child.close_on_exec = p.close_on_exec
+        child.name = p.name
+        # fd 表逐项复制但指向同一 OpenFile —— fork 后共享文件位置,
+        # 这是 `sh > file` 重定向语义的根基
+        for i, f in enumerate(p.fds):
+            if f is not None:
+                self._acquire_fd(f)
+                child.fds[i] = f
+        child.cpu = CPU(child.mem, on_int=self._on_int, on_fault=self._on_fault)
+        child.cpu.restore(p.cpu.snapshot())
+        child.cpu.regs[0] = 0                 # 子进程 fork 返回 0
+        self.procs[child.pid] = child
+        self.runq.append(child.pid)
+        return child.pid
+
+    def sys_waitpid(self, p, pid, statp, options):
+        pid = pid if pid < 0x80000000 else pid - 0x100000000
+        kids = [q for q in self.procs.values() if q.ppid == p.pid]
+        if not kids:
+            return -kvfs.ECHILD
+
+        def wanted(q):
+            if pid > 0:
+                return q.pid == pid
+            if pid == 0:
+                return q.pgrp == p.pgrp
+            if pid == -1:
+                return True
+            return q.pgrp == -pid
+
+        cands = [q for q in kids if wanted(q)]
+        if not cands:
+            return -kvfs.ECHILD
+        for q in cands:
+            if q.state == ZOMBIE:
+                if statp:
+                    p.mem.write_u32(statp, q.exit_code & 0xFFFFFFFF)
+                p.cutime += q.utime
+                p.cstime += q.stime
+                del self.procs[q.pid]
+                return q.pid
+        if options & 1:                       # WNOHANG
+            return 0
+        raise Blocked(("wait", p.pid))
+
+    def _exit_process(self, p: Process, code: int) -> None:
+        p.state = ZOMBIE
+        p.exit_code = code
+        for i, f in enumerate(p.fds):
+            if f is not None:
+                self._release_file(f)
+                p.fds[i] = None
+        p.mem = AddressSpace()               # 释放地址空间
+        for q in self.procs.values():        # 孤儿过继给 init
+            if q.ppid == p.pid:
+                q.ppid = 1
+        if p.pid in self.runq:
+            self.runq.remove(p.pid)
+        parent = self.procs.get(p.ppid)
+        if parent is not None:
+            self.post_signal(parent, SIGCHLD)
+            if parent.state == SLEEPING and \
+                    isinstance(parent.wait_channel, tuple) and \
+                    parent.wait_channel[0] == "wait":
+                self._wake(parent)
+        if p.ppid == 0:                      # init 退出 -> 整机结束
+            self.exit_status = code
+
+    def _acquire_fd(self, f: OpenFile) -> None:
+        """多出一个指向该 OpenFile 的描述符(fork/dup/dup2)."""
+        f.refs += 1
+        if isinstance(f.obj, Pipe):
+            # 管道按**描述符**计数: 只有指向写端的描述符全部关闭, 读端才见 EOF
+            if f.readable:
+                f.obj.readers += 1
+            if f.writable:
+                f.obj.writers += 1
+
+    def _release_file(self, f: OpenFile) -> None:
+        f.refs -= 1
+        obj = f.obj
+        if isinstance(obj, Pipe):
+            # 每关一个描述符就减一次, 不能等 refs 归零 —— fork 出来的描述符
+            # 共享同一个 OpenFile, 否则写端永远关不掉, 读端永远等不到 EOF
+            if f.readable:
+                obj.readers = max(obj.readers - 1, 0)
+            if f.writable:
+                obj.writers = max(obj.writers - 1, 0)
+        elif isinstance(obj, VInode) and f.refs <= 0:
+            obj.open_refs = max(obj.open_refs - 1, 0)
+
+    # ---- 管道 ---------------------------------------------------------
+
+    def sys_pipe(self, p, fds, b, c):
+        pipe = Pipe()
+        rfd = p.alloc_fd()
+        rf = OpenFile(pipe, 0)
+        p.fds[rfd] = rf
+        try:
+            wfd = p.alloc_fd()
+        except FsError:
+            p.fds[rfd] = None
+            raise
+        wf = OpenFile(pipe, O_WRONLY)
+        p.fds[wfd] = wf
+        pipe.readers = 1
+        pipe.writers = 1
+        p.mem.write_u32(fds, rfd)
+        p.mem.write_u32(fds + 4, wfd)
         return 0
 
-    # ---- 运行 ---------------------------------------------------------
+    # ---- 信号(基础部分, 帧构造在 K5) -----------------------------------
 
-    def run(self, max_instructions: int = 500_000_000) -> int:
-        """跑当前进程直到退出, 返回退出码."""
-        p = self.current
+    def post_signal(self, p: Process, sig: int) -> None:
+        if sig <= 0 or sig > 32:
+            return
+        p.signal |= 1 << (sig - 1)
+        if p.state != SLEEPING or (p.blocked & (1 << (sig - 1))):
+            return
+        # 只有真会被递达的信号才打断睡眠。默认动作是"忽略"的信号(SIGCHLD/
+        # SIGCONT)不能让 waitpid 拿到 EINTR —— 否则 bash 会把 -EINTR 当成
+        # 调用号重新执行 int 0x80。
+        handler = p.sigactions[sig][0] if sig < len(p.sigactions) else 0
+        if handler == 1:
+            return
+        if handler == 0 and sig in IGNORED_BY_DEFAULT:
+            return
+        self._wake(p, interrupted=True)
+
+    def _wake(self, p: Process, interrupted: bool = False) -> None:
+        """唤醒睡眠进程.
+
+        阻塞时 eip 已被回卷 2 字节以便重做 int 0x80。被信号打断的情形要把
+        eip 推回去(系统调用不重做), 并让 eax 带上 -EINTR。
+        """
+        if p.state != SLEEPING:
+            return
+        p.state = RUNNING
+        p.wait_channel = None
+        if interrupted and p.restart_syscall:
+            p.cpu.eip = (p.cpu.eip + 2) & 0xFFFFFFFF
+            p.cpu.regs[0] = (-kvfs.EINTR) & 0xFFFFFFFF
+            p.restart_syscall = False
+        if p.pid not in self.runq:
+            self.runq.append(p.pid)
+
+    def sys_kill(self, p, pid, sig, c):
+        pid = pid if pid < 0x80000000 else pid - 0x100000000
+        targets = []
+        for q in self.procs.values():
+            if pid > 0 and q.pid == pid:
+                targets.append(q)
+            elif pid == 0 and q.pgrp == p.pgrp:
+                targets.append(q)
+            elif pid == -1 and q.pid > 1:
+                targets.append(q)
+            elif pid < -1 and q.pgrp == -pid:
+                targets.append(q)
+        if not targets:
+            return -kvfs.ESRCH
+        if sig == 0:
+            return 0
+        for q in targets:
+            self.post_signal(q, sig)
+        return 0
+
+    def sys_sgetmask(self, p, a, b, c):
+        return p.blocked
+
+    def sys_ssetmask(self, p, mask, b, c):
+        old = p.blocked
+        p.blocked = mask & ~(1 << (SIGKILL - 1))
+        return old
+
+    def sys_pause(self, p, a, b, c):
+        raise Blocked(("pause", p.pid))
+
+    def sys_setsid(self, p, a, b, c):
+        if p.leader:
+            return -EPERM
+        p.leader = True
+        p.session = p.pid
+        p.pgrp = p.pid
+        p.tty = None
+        return p.pgrp
+
+    def sys_setpgid(self, p, pid, pgid, c):
+        target = p if pid == 0 else self.procs.get(pid)
+        if target is None:
+            return -kvfs.ESRCH
+        target.pgrp = pgid or target.pid
+        return 0
+
+    def sys_alarm(self, p, secs, b, c):
+        remain = max((p.alarm_at - self.jiffies) // HZ, 0) if p.alarm_at else 0
+        p.alarm_at = self.jiffies + secs * HZ if secs else 0
+        return remain
+
+    # ---- 调度 ---------------------------------------------------------
+
+    def _pump_tty(self) -> None:
+        if self.terminal is not None:
+            self.terminal.pump()
+
+    def _check_alarms(self) -> None:
+        for q in list(self.procs.values()):
+            if q.alarm_at and self.jiffies >= q.alarm_at:
+                q.alarm_at = 0
+                self.post_signal(q, SIGALRM)
+
+    def _pick(self) -> Optional[Process]:
+        """轮转挑一个可运行进程."""
+        n = len(self.runq)
+        for _ in range(n):
+            pid = self.runq.pop(0)
+            q = self.procs.get(pid)
+            if q is None or q.state == ZOMBIE:
+                continue
+            self.runq.append(pid)
+            if q.state == RUNNING:
+                return q
+        return None
+
+    def run(self, max_instructions: int = 2_000_000_000) -> int:
+        """调度循环: 协作式 + 指令预算."""
+        if self.current is not None and self.current.pid not in self.runq:
+            self.runq.append(self.current.pid)
         total = 0
+        idle = 0
         while total < max_instructions:
+            self._pump_tty()
+            self._check_alarms()
+            self._wake_waiters()             # 每轮都查等待条件, 否则两端互等会卡死
+            self._deliver_pending()
+            p = self._pick()
+            if p is None:
+                if not any(q.state != ZOMBIE for q in self.procs.values()):
+                    break
+                if self.terminal is not None:
+                    self.terminal.term.wait_input(0.02)
+                    self.terminal.pump()
+                self.jiffies += 2
+                idle += 1
+                if idle > 20000:            # 全员永久睡眠, 无输入可来
+                    break
+                continue
+            idle = 0
+            self.current = p
+            cpu = p.cpu
+            before = cpu.icount
             try:
-                n = p.cpu.run(TIMESLICE)
+                cpu.run(TIMESLICE)
+                if cpu.halted:
+                    self._exit_process(p, 0)
             except Exited as e:
-                self.exit_status = e.code
-                return e.code
-            except Blocked:
-                return -1
-            total += n
-            self.jiffies += max(n // (TIMESLICE // HZ), 1)
-            if p.cpu.halted:
-                break
+                self._exit_process(p, e.code)
+                if p.ppid == 0:
+                    return e.code
+            except Replaced:
+                pass                         # execve 已换好新 CPU, 下轮继续跑它
+            except MagicJump:
+                self._sigreturn(p)
+            except Blocked as e:
+                p.state = SLEEPING
+                p.wait_channel = e.channel
+                p.restart_syscall = True
+                cpu.eip -= 2                 # int 0x80 是 CD 80 两字节, 回卷重做
+                if p.pid in self.runq:
+                    self.runq.remove(p.pid)
+            finally:
+                # 用 icount 差值记账 —— 阻塞/退出都是异常路径, 靠 run() 的
+                # 返回值会漏记, 导致 max_instructions 永远到不了。
+                n = max(cpu.icount - before, 1)
+                total += n
+                p.utime += n
+                self.jiffies += max(n * HZ // TIMESLICE, 1)
         return self.exit_status
+
+    def _sigreturn(self, p: Process) -> None:
+        """兜底的信号返回: 弹出 _build_signal_frame 压下的帧.
+
+        正常情况下 libc 的 sa_restorer 会在用户态自己弹栈; 只有 restorer 为 0
+        时才走到这里(我们把 MAGIC_SIGRETURN 当作 restorer 压了进去)。
+        栈上此刻是: [signr] [blocked?] [eax] [ecx] [edx] [eflags] [old_eip]
+        (restorer 已被 handler 的 ret 弹掉)。
+        """
+        cpu = p.cpu
+        cpu.pop32()                            # signr
+        # 帧里有没有 blocked 取决于当初 sigaction 的 SA_NOMASK, 无法从栈上看出,
+        # 所以在压帧时记在进程上
+        if p.sigframes:
+            if p.sigframes.pop():
+                p.blocked = cpu.pop32()
+        cpu.regs[0] = cpu.pop32()
+        cpu.regs[1] = cpu.pop32()
+        cpu.regs[2] = cpu.pop32()
+        cpu.eflags = cpu.pop32()
+        cpu.eip = cpu.pop32()
+
+    def _wake_waiters(self) -> None:
+        """检查睡眠进程的等待条件是否已满足."""
+        for q in list(self.procs.values()):
+            if q.state != SLEEPING:
+                continue
+            ch = q.wait_channel
+            if isinstance(ch, tuple) and ch[0] == "piperead":
+                # 读端: 有数据可读, 或写端全关(EOF)才唤醒
+                if ch[1].buf or ch[1].writers == 0:
+                    self._wake(q)
+            elif isinstance(ch, tuple) and ch[0] == "pipewrite":
+                # 写端: 有空位, 或读端全关(该收 EPIPE)才唤醒
+                if ch[1].space > 0 or ch[1].readers == 0:
+                    self._wake(q)
+            elif isinstance(ch, tuple) and ch[0] == "wait":
+                if any(r.ppid == q.pid and r.state == ZOMBIE
+                       for r in self.procs.values()):
+                    self._wake(q)
+            elif ch is self.terminal:
+                if self.terminal is not None and \
+                        (self.terminal.ready or self.terminal.eof_pending):
+                    self._wake(q)
+
+    def _deliver_pending(self) -> None:
+        """在指令边界投递信号(与内核 ret_from_sys_call 处的时机等价)."""
+        for q in list(self.procs.values()):
+            if q.state == ZOMBIE:
+                continue
+            pend = q.signal & ~q.blocked
+            if not pend:
+                continue
+            sig = (pend & -pend).bit_length()          # 最低位优先, 同 bsfl
+            q.signal &= ~(1 << (sig - 1))
+            self._take_signal(q, sig)
+
+    def _take_signal(self, q: Process, sig: int) -> None:
+        handler = q.sigactions[sig][0] if sig < len(q.sigactions) else 0
+        if handler == 1:                              # SIG_IGN
+            return
+        if handler == 0:                              # SIG_DFL
+            if sig in IGNORED_BY_DEFAULT:
+                return
+            if sig in STOP_SIGNALS:
+                q.state = STOPPED
+                if q.pid in self.runq:
+                    self.runq.remove(q.pid)
+                return
+            if q.state == SLEEPING:
+                q.state = RUNNING
+            self._exit_process(q, sig)
+            if q.ppid == 0:
+                self.exit_status = sig
+            return
+        self._build_signal_frame(q, sig)
+
+    def _build_signal_frame(self, q: Process, sig: int) -> None:
+        """在用户栈上构造信号帧.
+
+        布局照内核 kernel/signal.c 的 do_signal: 压 7 或 8 个长字
+        (SA_NOMASK 时 7 个), 顺序为
+        sa_restorer, signr, [blocked,] eax, ecx, edx, eflags, old_eip;
+        然后把 eip 改成 handler。0.11 没有 sigreturn 系统调用 —— 返回靠
+        libc 提供的 sa_restorer 在用户态弹栈恢复。
+        """
+        handler, mask, flags, restorer = q.sigactions[sig]
+        cpu = q.cpu
+        if q.state == SLEEPING:
+            q.state = RUNNING
+            q.wait_channel = None
+            if q.pid not in self.runq:
+                self.runq.append(q.pid)
+        old_eip = cpu.eip
+        eax, ecx, edx = cpu.regs[0], cpu.regs[1], cpu.regs[2]
+        eflags = cpu.eflags
+        nomask = bool(flags & SA_NOMASK)
+        cpu.push32(old_eip)
+        cpu.push32(eflags)
+        cpu.push32(edx)
+        cpu.push32(ecx)
+        cpu.push32(eax)
+        if not nomask:
+            cpu.push32(q.blocked)
+        q.sigframes.append(not nomask)
+        cpu.push32(sig)
+        cpu.push32(restorer or MAGIC_SIGRETURN)
+        cpu.eip = handler
+        q.blocked |= mask
+        if flags & SA_ONESHOT:
+            q.sigactions[sig] = (0, mask, flags, restorer)
+
+    def sys_signal(self, p, sig, handler, restorer):
+        """0.11 的 signal 是三参: ebx=signum, ecx=handler, edx=restorer."""
+        if not 1 <= sig <= 32 or sig == SIGKILL:
+            return -EINVAL
+        old = p.sigactions[sig][0]
+        p.sigactions[sig] = (handler, 0, SA_ONESHOT | SA_NOMASK, restorer)
+        return old
+
+    def sys_sigaction(self, p, sig, newp, oldp):
+        if not 1 <= sig <= 32 or sig == SIGKILL:
+            return -EINVAL
+        cur = p.sigactions[sig]
+        if oldp:
+            for i, v in enumerate(cur):
+                p.mem.write_u32(oldp + 4 * i, v)
+        if newp:
+            vals = tuple(p.mem.read_u32(newp + 4 * i) for i in range(4))
+            p.sigactions[sig] = vals
+        return 0
 
 
 class NullDevice:
