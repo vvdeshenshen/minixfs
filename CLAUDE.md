@@ -12,7 +12,7 @@ Minix 分区从字节偏移 1024 开始, magic 0x137F(文件名 14 字符)。
 
 ```bash
 # 全部测试(无需真实镜像; 镜像存在时会多跑几个集成测试)
-python3 -m unittest test_minixfs
+python3 -m unittest test_minixfs test_cpu86 test_kvfs test_kernel test_ktty
 
 # 单个测试类 / 单个测试
 python3 -m unittest test_minixfs.TestCheckFs
@@ -23,13 +23,24 @@ python3 minix_shell.py hdc-0.11.img
 
 # 非交互验证(stdout 非 TTY 时 less 退化为直接输出)
 printf 'ls -l /bin\nexit\n' | python3 minix_shell.py hdc-0.11.img
+
+# 仿真器: 交互式 bash / 单个程序 / 可脚本化
+python3 emulator.py hdc-0.11.img
+python3 emulator.py hdc-0.11.img /bin/date
+printf 'echo hi | cat\nexit\n' | python3 emulator.py hdc-0.11.img
+python3 emulator.py hdc-0.11.img /bin/sh --trace     # 打印系统调用轨迹
 ```
 
 无外部依赖, 仅标准库; 无 lint 配置。
 
 ## 架构
 
-三层结构, 依赖方向单一: `minix_shell.py` → `minixfs.py` + `pager.py`。
+两套工具共用只读解析库, 依赖方向严格单向, **minixfs.py 与 pager.py 不被仿真器修改**:
+```
+minix_shell.py → minixfs.py + pager.py            浏览器
+emulator.py → kernel.py → {ksyscall, kexec, kproc 相关, kvfs, ktty} → minixfs.py
+cpu86.py → x86mem.py                              CPU 层不 import minixfs 与内核层
+```
 
 - **minixfs.py** — 解析库, 不做任何输出。`MinixFS` 提供块/inode/目录/
   文件读取(直接块 + 一级/二级间接块, zone 0 视为空洞补零)、MBR 分区
@@ -53,6 +64,32 @@ printf 'ls -l /bin\nexit\n' | python3 minix_shell.py hdc-0.11.img
 注意 fixture 中 sparse.bin(inode 7) 的空洞是 checkfs 的**预期**报告,
 相关断言需先排除它。shell 测试向 `MinixShell(stdout=StringIO)` 注入
 输出流, 分页测试用脚本化按键序列注入 `Pager(read_key=...)`。
+
+## 仿真器(改代码前必读)
+
+- **ABI 一律从镜像内部查证, 不要凭记忆**: 镜像带着 `/usr/src/linux` 的内核 C 源码
+  (`fs/` 18 个 .c, `kernel/` 10 个 .c)与完整 `/usr/include`。查法:
+  `fs.read_file(fs.resolve('/usr/src/linux/fs/exec.c'))`。已据此确认: 初始栈布局
+  (`create_tables`)、64MB 地址空间(`change_ldt`)、`brk` 恒返回当前值(`sys.c`)、
+  信号帧 7/8 长字(`signal.c` 的 `do_signal`)、87 项调用表(`include/linux/sys.h`)、
+  termios 码(`include/termios.h`)。
+- **这个镜像的内核是打过补丁的后期版本**, 87 个调用(不是经典 0.11 的 72 个),
+  镜像 libc 确实用到 `lstat/readlink/getrlimit` 等超出部分。
+- 0.11 **没有 sigreturn 系统调用**: 信号返回靠 libc 的 `sa_restorer` 在用户态弹栈,
+  所以 `signal(48)` 是三参(edx=restorer)。restorer 为 0 时走 `MAGIC_SIGRETURN` 兜底。
+- 三个容易再踩的坑(都已有回归测试):
+  ① 被信号唤醒时必须把 eip 推回(不重做系统调用), 否则 eax 里的 `-EINTR` 会被当成
+     调用号; 且默认动作为忽略的信号不能打断 waitpid。
+  ② 调度器的指令记账要用 `cpu.icount` 差值 —— Blocked/Exited 都走异常路径,
+     靠 `run()` 返回值会漏记而死循环。
+  ③ 管道读写端计数按**描述符**增减(`_acquire_fd`), 不能等 OpenFile 的 refs 归零,
+     否则 fork 后写端永远关不掉, 流水线死锁。
+- `execve` 必须抛 `Replaced` 打断旧 `cpu.run()` 循环(旧 CPU 持有已失效的内存)。
+- x87 未实现(镜像 libc 是软浮点), 遇到就抛带 eip 与机器码字节的 `CpuError` —— 这是
+  刻意的策略, 别改成静默跳过。
+- 镜像自身的坑: 无 `/dev/console`、无 `/etc/inittab`、`/dev/null` 被误建为块设备
+  (故设备分派不检查 b/c 类型)、`/etc/mtab` 的 mtime 超出有符号 i32(故 stat 按无符号
+  打包, 与内核 `cp_stat` 逐字段拷 32 位一致)。
 
 ## 领域细节(改代码前必读)
 
