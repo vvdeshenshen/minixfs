@@ -212,6 +212,98 @@ def xchg_rr(a, b):
     return bytes([0x87]) + rr(b, a)
 
 
+def movsb():
+    return b"\xa4"
+
+
+def movsd_():
+    return b"\xa5"
+
+
+def stosb():
+    return b"\xaa"
+
+
+def stosd():
+    return b"\xab"
+
+
+def lodsb():
+    return b"\xac"
+
+
+def lodsd():
+    return b"\xad"
+
+
+def cmpsb():
+    return b"\xa6"
+
+
+def scasb():
+    return b"\xae"
+
+
+def rep(code):
+    return b"\xf3" + code
+
+
+def repne(code):
+    return b"\xf2" + code
+
+
+def bt_ri(reg, bit):
+    return bytes([0x0F, 0xBA]) + rr(4, reg) + bytes([bit])
+
+
+def bts_ri(reg, bit):
+    return bytes([0x0F, 0xBA]) + rr(5, reg) + bytes([bit])
+
+
+def btr_ri(reg, bit):
+    return bytes([0x0F, 0xBA]) + rr(6, reg) + bytes([bit])
+
+
+def bt_rr(rm, reg):
+    return bytes([0x0F, 0xA3]) + rr(reg, rm)
+
+
+def bsf(dst, src):
+    return bytes([0x0F, 0xBC]) + rr(dst, src)
+
+
+def bsr(dst, src):
+    return bytes([0x0F, 0xBD]) + rr(dst, src)
+
+
+def shld_ri(rm, reg, cnt):
+    return bytes([0x0F, 0xA4]) + rr(reg, rm) + bytes([cnt])
+
+
+def shrd_ri(rm, reg, cnt):
+    return bytes([0x0F, 0xAC]) + rr(reg, rm) + bytes([cnt])
+
+
+def loop(rel8):
+    return bytes([0xE2, rel8 & 0xFF])
+
+
+def jecxz(rel8):
+    return bytes([0xE3, rel8 & 0xFF])
+
+
+def xlat():
+    return b"\xd7"
+
+
+def sahf():
+    return b"\x9e"
+
+
+def lahf():
+    return b"\x9f"
+
+
 HLT = b"\xf4"
 NOP = b"\x90"
 INT80 = b"\xcd\x80"
@@ -855,6 +947,241 @@ class TestControlFlow(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# 字符串指令
+# ---------------------------------------------------------------------------
+
+class TestStringOps(FlagAsserts):
+    def _cpu_with_data(self, *chunks, src=b"", regs=None):
+        cpu = build_cpu(*chunks, HLT, regs=regs)
+        if src:
+            cpu.mem.write(0x1000, src)
+        return cpu
+
+    def test_movsb_single(self):
+        cpu = self._cpu_with_data(movsb(), src=b"XY",
+                                  regs={"esi": 0x1000, "edi": 0x1100})
+        cpu.run(10)
+        self.assertEqual(cpu.mem.read(0x1100, 1), b"X")
+        self.assertEqual((cpu.regs[ESI], cpu.regs[EDI]), (0x1001, 0x1101))
+
+    def test_movsb_backward_when_df_set(self):
+        cpu = self._cpu_with_data(STD, movsb(), src=b"XY",
+                                  regs={"esi": 0x1000, "edi": 0x1100})
+        cpu.run(10)
+        self.assertEqual((cpu.regs[ESI], cpu.regs[EDI]), (0x0FFF, 0x10FF))
+
+    def test_rep_movsb_copies_block(self):
+        data = bytes(range(64))
+        cpu = self._cpu_with_data(rep(movsb()), src=data,
+                                  regs={"esi": 0x1000, "edi": 0x1200,
+                                        "ecx": 64})
+        cpu.run(10)
+        self.assertEqual(cpu.mem.read(0x1200, 64), data)
+        self.assertEqual(cpu.regs[ECX], 0)
+
+    def test_rep_movsd_copies_dwords(self):
+        data = struct.pack("<4I", 1, 2, 3, 4)
+        cpu = self._cpu_with_data(rep(movsd_()), src=data,
+                                  regs={"esi": 0x1000, "edi": 0x1200,
+                                        "ecx": 4})
+        cpu.run(10)
+        self.assertEqual(cpu.mem.read(0x1200, 16), data)
+        self.assertEqual((cpu.regs[ESI], cpu.regs[EDI]), (0x1010, 0x1210))
+
+    def test_rep_movs_fast_path_matches_slow_path(self):
+        """整块搬的快路径与逐条慢路径(DF=1 反向)结果必须一致."""
+        data = bytes((i * 7) & 0xFF for i in range(32))
+        fast = self._cpu_with_data(rep(movsb()), src=data,
+                                   regs={"esi": 0x1000, "edi": 0x1200,
+                                         "ecx": 32})
+        fast.run(10)
+        # 反向: 从末字节开始, 目标也从末字节开始, 结果应完全相同
+        slow = self._cpu_with_data(STD, rep(movsb()), src=data,
+                                   regs={"esi": 0x1000 + 31, "edi": 0x1200 + 31,
+                                         "ecx": 32})
+        slow.run(10)
+        self.assertEqual(fast.mem.read(0x1200, 32), data)
+        self.assertEqual(slow.mem.read(0x1200, 32), data)
+
+    def test_rep_movs_overlapping_uses_slow_path(self):
+        # 目标与源重叠 1 字节: 必须逐条搬(会产生字节复制效果), 不能整块搬
+        cpu = self._cpu_with_data(rep(movsb()), src=b"AB" + bytes(8),
+                                  regs={"esi": 0x1000, "edi": 0x1001,
+                                        "ecx": 4})
+        cpu.run(10)
+        # 逐条: [1001]=A, [1002]=B(此时源已是刚写的?) —— x86 语义是逐字节顺序搬
+        self.assertEqual(cpu.mem.read(0x1000, 5), b"AAAAA")
+
+    def test_rep_with_zero_count_is_noop(self):
+        cpu = self._cpu_with_data(rep(movsb()), src=b"XY",
+                                  regs={"esi": 0x1000, "edi": 0x1100,
+                                        "ecx": 0})
+        cpu.run(10)
+        self.assertEqual(cpu.mem.read(0x1100, 1), b"\x00")
+        self.assertEqual(cpu.regs[ESI], 0x1000)
+
+    def test_rep_stosb_fills(self):
+        cpu = build_cpu(mov_r8i(0, 0x41), rep(stosb()), HLT,
+                        regs={"edi": 0x1000, "ecx": 10})
+        cpu.run(10)
+        self.assertEqual(cpu.mem.read(0x1000, 11), b"A" * 10 + b"\x00")
+
+    def test_rep_stosd_fills_dwords(self):
+        cpu = build_cpu(mov_ri(EAX, 0xDEADBEEF), rep(stosd()), HLT,
+                        regs={"edi": 0x1000, "ecx": 3})
+        cpu.run(10)
+        self.assertEqual(cpu.mem.read(0x1000, 12),
+                         struct.pack("<3I", 0xDEADBEEF, 0xDEADBEEF, 0xDEADBEEF))
+
+    def test_lodsb_and_lodsd(self):
+        cpu = self._cpu_with_data(lodsb(), src=b"\x5a", regs={"esi": 0x1000})
+        cpu.run(10)
+        self.assertEqual(cpu.regs[EAX] & 0xFF, 0x5A)
+        cpu = self._cpu_with_data(lodsd(), src=p32(0x11223344),
+                                  regs={"esi": 0x1000})
+        cpu.run(10)
+        self.assertEqual(cpu.regs[EAX], 0x11223344)
+
+    def test_cmpsb_sets_flags(self):
+        cpu = build_cpu(cmpsb(), HLT, regs={"esi": 0x1000, "edi": 0x1100})
+        cpu.mem.write(0x1000, b"A")
+        cpu.mem.write(0x1100, b"A")
+        cpu.run(10)
+        self.assertFlags(cpu, zf=1)
+
+    def test_repe_cmpsb_stops_at_difference(self):
+        # 比较 "abcXef" 与 "abcYef": 在第 4 字节不等时停下
+        cpu = build_cpu(rep(cmpsb()), HLT,
+                        regs={"esi": 0x1000, "edi": 0x1100, "ecx": 6})
+        cpu.mem.write(0x1000, b"abcXef")
+        cpu.mem.write(0x1100, b"abcYef")
+        cpu.run(10)
+        self.assertFlags(cpu, zf=0)
+        self.assertEqual(cpu.regs[ECX], 2)      # 消耗了 4 次, 剩 2
+        self.assertEqual(cpu.regs[ESI], 0x1004)
+
+    def test_repe_cmpsb_full_match(self):
+        cpu = build_cpu(rep(cmpsb()), HLT,
+                        regs={"esi": 0x1000, "edi": 0x1100, "ecx": 3})
+        cpu.mem.write(0x1000, b"abc")
+        cpu.mem.write(0x1100, b"abc")
+        cpu.run(10)
+        self.assertFlags(cpu, zf=1)
+        self.assertEqual(cpu.regs[ECX], 0)
+
+    def test_repne_scasb_finds_byte(self):
+        # 经典 strlen: 在 "hello\0" 里找 0
+        cpu = build_cpu(mov_r8i(0, 0), repne(scasb()), HLT,
+                        regs={"edi": 0x1000, "ecx": 0xFFFF})
+        cpu.mem.write(0x1000, b"hello\x00")
+        cpu.run(10)
+        # edi 停在 0 字节之后, 长度 = 扫过的字节数 - 1
+        self.assertEqual(cpu.regs[EDI], 0x1006)
+        self.assertEqual(0xFFFF - cpu.regs[ECX] - 1, 5)
+
+    def test_scasb_single(self):
+        cpu = build_cpu(mov_r8i(0, 0x41), scasb(), HLT, regs={"edi": 0x1000})
+        cpu.mem.write(0x1000, b"A")
+        cpu.run(10)
+        self.assertFlags(cpu, zf=1)
+
+    def test_16bit_movs_with_prefix(self):
+        cpu = self._cpu_with_data(b"\x66" + movsd_(), src=p16(0xBEEF),
+                                  regs={"esi": 0x1000, "edi": 0x1100})
+        cpu.run(10)
+        self.assertEqual(cpu.mem.read_u16(0x1100), 0xBEEF)
+        self.assertEqual(cpu.regs[ESI], 0x1002)
+
+    def test_cld_std_control_direction(self):
+        cpu = run_code(STD)
+        self.assertTrue(cpu.flags & DF)
+        cpu = run_code(STD, CLD)
+        self.assertFalse(cpu.flags & DF)
+
+    def test_string_op_preserves_df_across_alu(self):
+        # ALU 指令不应清掉 DF
+        cpu = run_code(STD, mov_ri(EAX, 1), alu_ri8(0, EAX, 1))
+        self.assertTrue(cpu.flags & DF)
+
+
+# ---------------------------------------------------------------------------
+# 位操作与其余第二批指令
+# ---------------------------------------------------------------------------
+
+class TestBitOps(FlagAsserts):
+    def test_bt_reads_bit(self):
+        cpu = run_code(mov_ri(EAX, 0b1000), bt_ri(EAX, 3))
+        self.assertFlags(cpu, cf=1)
+        cpu = run_code(mov_ri(EAX, 0b1000), bt_ri(EAX, 2))
+        self.assertFlags(cpu, cf=0)
+
+    def test_bts_sets_bit(self):
+        cpu = run_code(mov_ri(EAX, 0), bts_ri(EAX, 5))
+        self.assertEqual(cpu.regs[EAX], 0b100000)
+        self.assertFlags(cpu, cf=0)
+
+    def test_btr_clears_bit(self):
+        cpu = run_code(mov_ri(EAX, 0xFF), btr_ri(EAX, 0))
+        self.assertEqual(cpu.regs[EAX], 0xFE)
+        self.assertFlags(cpu, cf=1)
+
+    def test_bt_register_form_masks_count(self):
+        # 寄存器形式对寄存器操作数取模 32
+        cpu = run_code(mov_ri(EAX, 1), mov_ri(EBX, 32), bt_rr(EAX, EBX))
+        self.assertFlags(cpu, cf=1)         # 32 & 31 = 0, 第 0 位是 1
+
+    def test_bsf_bsr(self):
+        cpu = run_code(mov_ri(EBX, 0b101000), bsf(EAX, EBX), bsr(ECX, EBX))
+        self.assertEqual(cpu.regs[EAX], 3)
+        self.assertEqual(cpu.regs[ECX], 5)
+
+    def test_bsf_zero_sets_zf(self):
+        cpu = run_code(mov_ri(EAX, 0xFF), mov_ri(EBX, 0), bsf(EAX, EBX))
+        self.assertFlags(cpu, zf=1)
+        self.assertEqual(cpu.regs[EAX], 0xFF)   # 源为 0 时目标不变
+
+    def test_shld_shrd(self):
+        cpu = run_code(mov_ri(EAX, 0xF0000000), mov_ri(EBX, 0x0000000F),
+                       shld_ri(EAX, EBX, 4))
+        self.assertEqual(cpu.regs[EAX], 0x00000000)
+        cpu = run_code(mov_ri(EAX, 0x0000000F), mov_ri(EBX, 0xF0000000),
+                       shrd_ri(EAX, EBX, 4))
+        self.assertEqual(cpu.regs[EAX], 0x00000000)
+
+    def test_shrd_shifts_in_from_src(self):
+        cpu = run_code(mov_ri(EAX, 0x10), mov_ri(EBX, 0xFFFFFFFF),
+                       shrd_ri(EAX, EBX, 4))
+        self.assertEqual(cpu.regs[EAX], 0xF0000001)
+
+    def test_loop_counts_down(self):
+        cpu = run_code(mov_ri(ECX, 5), mov_ri(EAX, 0),
+                       inc_r(EAX), loop(-3))
+        self.assertEqual(cpu.regs[EAX], 5)
+        self.assertEqual(cpu.regs[ECX], 0)
+
+    def test_jecxz(self):
+        cpu = run_code(mov_ri(ECX, 0), jecxz(5), mov_ri(EAX, 0xBAD))
+        self.assertEqual(cpu.regs[EAX], 0)
+
+    def test_xlat(self):
+        cpu = build_cpu(mov_ri(EBX, 0x1000), mov_r8i(0, 2), xlat(), HLT)
+        cpu.mem.write(0x1000, b"\x10\x20\x30\x40")
+        cpu.run(10)
+        self.assertEqual(cpu.regs[EAX] & 0xFF, 0x30)
+
+    def test_sahf_lahf_roundtrip(self):
+        cpu = run_code(STC, lahf(), CLC, sahf())
+        self.assertFlags(cpu, cf=1)
+
+    def test_enter_builds_frame(self):
+        cpu = run_code(mov_ri(EBP, 0xAAAA),
+                       b"\xc8" + p16(0x10) + b"\x00")     # enter 0x10, 0
+        # ebp 变为新帧指针, esp 再降 0x10
+        self.assertEqual(cpu.regs[ESP], cpu.regs[EBP] - 0x10)
+        self.assertEqual(cpu.mem.read_u32(cpu.regs[EBP]), 0xAAAA)
+
+
+# ---------------------------------------------------------------------------
 # 陷入与错误
 # ---------------------------------------------------------------------------
 
@@ -1026,6 +1353,76 @@ class TestRealisticSequences(unittest.TestCase):
         cpu.mem.write_u32(0x1004, base + 6)
         cpu.run(50)
         self.assertEqual(cpu.regs[ECX], 0xBBB)
+
+
+class TestRealLibcCode(unittest.TestCase):
+    """跑镜像 /bin/date 里摘出的真实 libc 机器码.
+
+    字节序列是从 hdc-0.11.img 的 text 段原样摘录后硬编码在此(不依赖镜像),
+    比手写用例更能证明解码器面对真实编译器输出是对的。
+    """
+
+    # /bin/date text+0x455 起的 strlen:
+    #   b9 ff ff ff ff   mov  ecx, 0xffffffff
+    #   8b 7d 08         mov  edi, [ebp+8]
+    #   31 c0            xor  eax, eax
+    #   fc               cld
+    #   f2 ae            repne scasb
+    #   f7 d1            not  ecx
+    #   49               dec  ecx
+    STRLEN = bytes.fromhex("b9 ffffffff 8b7d08 31c0 fc f2ae f7d1 49".replace(" ", ""))
+
+    # /bin/date text+0x7565 起的三字搬运:
+    #   83 ec 0c         sub  esp, 12
+    #   89 e7            mov  edi, esp
+    #   8d 75 f4         lea  esi, [ebp-12]
+    #   b9 03 00 00 00   mov  ecx, 3
+    #   fc               cld
+    #   f3 a5            rep  movsd
+    MEMCPY3 = bytes.fromhex("83ec0c 89e7 8d75f4 b903000000 fc f3a5".replace(" ", ""))
+
+    def test_libc_strlen_on_various_strings(self):
+        for s in (b"", b"a", b"hello", b"x" * 200,
+                  bytes(range(1, 256))):          # 含全部非零字节值
+            with self.subTest(length=len(s)):
+                cpu = build_cpu(self.STRLEN, HLT)
+                cpu.regs[EBP] = 0x1000
+                cpu.mem.write_u32(0x1008, 0x1400)       # [ebp+8] = 字符串指针
+                cpu.mem.write(0x1400, s + b"\x00")
+                cpu.run(2000)
+                self.assertEqual(cpu.regs[ECX], len(s))
+
+    def test_libc_strlen_leaves_edi_past_nul(self):
+        cpu = build_cpu(self.STRLEN, HLT)
+        cpu.regs[EBP] = 0x1000
+        cpu.mem.write_u32(0x1008, 0x1400)
+        cpu.mem.write(0x1400, b"abc\x00")
+        cpu.run(2000)
+        self.assertEqual(cpu.regs[EDI], 0x1404)   # 停在 NUL 之后
+
+    def test_libc_memcpy_three_dwords(self):
+        cpu = build_cpu(self.MEMCPY3, HLT)
+        cpu.regs[EBP] = 0x1400
+        payload = struct.pack("<3I", 0x11111111, 0x22222222, 0x33333333)
+        cpu.mem.write(0x1400 - 12, payload)       # [ebp-12] 起的源数据
+        sp_before = cpu.regs[ESP]
+        cpu.run(2000)
+        self.assertEqual(cpu.mem.read(sp_before - 12, 12), payload)
+        self.assertEqual(cpu.regs[ECX], 0)
+
+    def test_date_entry_prologue_decodes(self):
+        """/bin/date 入口的前几条指令: 取 envp 存入 environ.
+
+        8b 44 24 08   mov eax, [esp+8]      <- envp(内核 create_tables 的布局)
+        a3 00 90 00 00  mov [0x9000], eax   <- data 段的 environ
+        """
+        entry = bytes.fromhex("8b442408" "a300900000")
+        cpu = build_cpu(entry, HLT, data_size=0x10000)
+        cpu.regs[ESP] = 0x3FFF000
+        cpu.mem.write_u32(0x3FFF008, 0xCAFE)      # 假的 envp 指针
+        cpu.run(10)
+        self.assertEqual(cpu.regs[EAX], 0xCAFE)
+        self.assertEqual(cpu.mem.read_u32(0x9000), 0xCAFE)
 
 
 if __name__ == "__main__":

@@ -422,6 +422,7 @@ class CPU:
         """执行一条指令."""
         self._insn_start = self.eip
         opsize = 4
+        rep = 0                       # 0=无, 0xF3=rep/repe, 0xF2=repne
         while True:
             op = self._fetch8()
             if op == 0x66:            # 操作数尺寸前缀
@@ -431,7 +432,15 @@ class CPU:
                 continue              # 段前缀: 平坦模型下忽略
             if op == 0xF0:            # lock
                 continue
+            if op in (0xF2, 0xF3):
+                rep = op
+                continue
             break
+        if rep and 0xA4 <= op <= 0xAF:
+            self._string_op(op, opsize, rep)
+            return
+        if rep and op in (0x90,):     # pause = f3 90
+            return
         self._execute(op, opsize)
 
     def _bad(self, op: int, extra: str = "未实现的指令") -> None:
@@ -640,6 +649,11 @@ class CPU:
             self._write_rm(0, 0, self._fetch32(), opsize, self._read_reg(0, opsize))
             return
 
+        # ---- A4-AF 字符串指令(无 rep 前缀, 执行一次) ----
+        if 0xA4 <= op <= 0xAF and op not in (0xA8, 0xA9):
+            self._string_op(op, opsize, 0)
+            return
+
         # ---- A8/A9 test al/eax, imm ----
         if op == 0xA8:
             self._set_logic_flags(self.get_reg8(0) & self._fetch8(), 1)
@@ -712,6 +726,51 @@ class CPU:
         # ---- F4 hlt ----
         if op == 0xF4:
             self.halted = True
+            return
+
+        # ---- 9E sahf / 9F lahf ----
+        if op == 0x9E:
+            ah = self.get_reg8(4)
+            self.flags = (self.flags & ~0xFF) | (ah & 0xD5) | 0x02
+            return
+        if op == 0x9F:
+            self.set_reg8(4, self.flags & 0xFF)
+            return
+
+        # ---- C8 enter ----
+        if op == 0xC8:
+            alloc = self._fetch16()
+            level = self._fetch8() & 31
+            self.push32(regs[EBP])
+            frame = regs[ESP]
+            for _ in range(level):
+                regs[EBP] = (regs[EBP] - 4) & MASK32
+                self.push32(mem.read_u32(regs[EBP]))
+            if level:
+                self.push32(frame)
+            regs[EBP] = frame
+            regs[ESP] = (regs[ESP] - alloc) & MASK32
+            return
+
+        # ---- D7 xlat ----
+        if op == 0xD7:
+            self.set_reg8(0, mem.read_u8((regs[EBX] + self.get_reg8(0)) & MASK32))
+            return
+
+        # ---- E0-E2 loop 族 / E3 jecxz ----
+        if 0xE0 <= op <= 0xE3:
+            rel = _sx8(self._fetch8())
+            if op == 0xE3:
+                take = (regs[ECX] & MASK32) == 0
+            else:
+                regs[ECX] = (regs[ECX] - 1) & MASK32
+                take = regs[ECX] != 0
+                if op == 0xE1:                       # loope
+                    take = take and bool(self.flags & ZF)
+                elif op == 0xE0:                     # loopne
+                    take = take and not (self.flags & ZF)
+            if take:
+                self.eip = (self.eip + rel) & MASK32
             return
 
         # ---- F6/F7 组: test/not/neg/mul/imul/div/idiv ----
@@ -999,6 +1058,98 @@ class CPU:
         f |= _PARITY[res & 0xFF]
         self.flags = f
 
+    # ---- 字符串指令 ---------------------------------------------------
+
+    def _string_op(self, op: int, opsize: int, rep: int) -> None:
+        """movs/stos/lods/scas/cmps, 可带 rep/repe/repne 前缀.
+
+        rep 为 0 时执行一次; 否则按 ecx 计数循环。
+        DF=1 时地址递减(memmove 反向拷贝要用)。
+        """
+        size = 1 if op in (0xA4, 0xA6, 0xAA, 0xAC, 0xAE) else opsize
+        back = bool(self.flags & DF)
+        delta = -size if back else size
+        regs = self.regs
+        mem = self.mem
+
+        if rep:
+            cnt = regs[ECX] & MASK32
+            if cnt == 0:
+                return
+        else:
+            cnt = 1
+
+        # movs 与 stos 在正向、无重叠时可整块搬, 一条指令一次 memcpy
+        if not back and rep and op in (0xA4, 0xA5) and cnt > 1:
+            n = cnt * size
+            src, dst = regs[ESI] & MASK32, regs[EDI] & MASK32
+            if abs(dst - src) >= n:                    # 无重叠才能整块搬
+                mem.write(dst, mem.read(src, n))
+                regs[ESI] = (src + n) & MASK32
+                regs[EDI] = (dst + n) & MASK32
+                regs[ECX] = 0
+                return
+        if not back and rep and op in (0xAA, 0xAB) and cnt > 1:
+            val = self._read_reg(0, size)
+            chunk = val.to_bytes(size, "little") * cnt
+            dst = regs[EDI] & MASK32
+            mem.write(dst, chunk)
+            regs[EDI] = (dst + len(chunk)) & MASK32
+            regs[ECX] = 0
+            return
+
+        while cnt:
+            if op in (0xA4, 0xA5):                     # movs
+                v = self._read_mem_sized(regs[ESI], size)
+                self._write_mem_sized(regs[EDI], size, v)
+                regs[ESI] = (regs[ESI] + delta) & MASK32
+                regs[EDI] = (regs[EDI] + delta) & MASK32
+            elif op in (0xAA, 0xAB):                   # stos
+                self._write_mem_sized(regs[EDI], size, self._read_reg(0, size))
+                regs[EDI] = (regs[EDI] + delta) & MASK32
+            elif op in (0xAC, 0xAD):                   # lods
+                self._write_reg(0, size,
+                                self._read_mem_sized(regs[ESI], size))
+                regs[ESI] = (regs[ESI] + delta) & MASK32
+            elif op in (0xA6, 0xA7):                   # cmps
+                a = self._read_mem_sized(regs[ESI], size)
+                b = self._read_mem_sized(regs[EDI], size)
+                self._set_sub_flags(a, b, a - b, size)
+                regs[ESI] = (regs[ESI] + delta) & MASK32
+                regs[EDI] = (regs[EDI] + delta) & MASK32
+            elif op in (0xAE, 0xAF):                   # scas
+                a = self._read_reg(0, size)
+                b = self._read_mem_sized(regs[EDI], size)
+                self._set_sub_flags(a, b, a - b, size)
+                regs[EDI] = (regs[EDI] + delta) & MASK32
+            else:
+                self._bad(op, "字符串指令")
+                return
+
+            cnt -= 1
+            if rep:
+                regs[ECX] = cnt
+                # cmps/scas 带 repe/repne 时按 ZF 提前结束
+                if op in (0xA6, 0xA7, 0xAE, 0xAF):
+                    zf = bool(self.flags & ZF)
+                    if (rep == 0xF3 and not zf) or (rep == 0xF2 and zf):
+                        return
+
+    def _read_mem_sized(self, addr: int, size: int) -> int:
+        if size == 1:
+            return self.mem.read_u8(addr)
+        if size == 2:
+            return self.mem.read_u16(addr)
+        return self.mem.read_u32(addr)
+
+    def _write_mem_sized(self, addr: int, size: int, val: int) -> None:
+        if size == 1:
+            self.mem.write_u8(addr, val)
+        elif size == 2:
+            self.mem.write_u16(addr, val)
+        else:
+            self.mem.write_u32(addr, val)
+
     # ---- 0F 两字节 opcode ---------------------------------------------
 
     def _execute_0f(self, op: int, opsize: int) -> None:
@@ -1034,6 +1185,85 @@ class CPU:
             f |= _PARITY[low & 0xFF]
             self.flags = f
             return
+        # A3/AB/B3/BB bt/bts/btr/btc(寄存器形式), BA /4-/7 是立即数形式
+        if op in (0xA3, 0xAB, 0xB3, 0xBB, 0xBA):
+            mod, reg, rm, addr = self._modrm()
+            if op == 0xBA:
+                sub = reg
+                if sub < 4:
+                    self._bad(0x0F00 | op, f"0F BA /{sub} 未实现")
+                    return
+                bit = self._fetch8()
+            else:
+                sub = {0xA3: 4, 0xAB: 5, 0xB3: 6, 0xBB: 7}[op]
+                bit = self._read_reg(reg, opsize)
+            bits = opsize * 8
+            if mod == 3:
+                bit &= bits - 1
+                val = self._read_rm(mod, rm, addr, opsize)
+            else:
+                addr = (addr + (bit // bits) * opsize) & MASK32
+                bit &= bits - 1
+                val = self._read_mem_sized(addr, opsize)
+            cur = (val >> bit) & 1
+            self.flags = (self.flags & ~CF) | (CF if cur else 0)
+            if sub == 5:
+                val |= 1 << bit
+            elif sub == 6:
+                val &= ~(1 << bit)
+            elif sub == 7:
+                val ^= 1 << bit
+            if sub != 4:
+                if mod == 3:
+                    self._write_rm(mod, rm, addr, opsize, val)
+                else:
+                    self._write_mem_sized(addr, opsize, val)
+            return
+
+        # BC/BD bsf/bsr
+        if op in (0xBC, 0xBD):
+            mod, reg, rm, addr = self._modrm()
+            v = self._read_rm(mod, rm, addr, opsize)
+            if v == 0:
+                self.flags |= ZF
+                return
+            self.flags &= ~ZF
+            idx = (v & -v).bit_length() - 1 if op == 0xBC else v.bit_length() - 1
+            self._write_reg(reg, opsize, idx)
+            return
+
+        # A4/AC shld/shrd(立即数形式), A5/AD 按 CL
+        if op in (0xA4, 0xA5, 0xAC, 0xAD):
+            mod, reg, rm, addr = self._modrm()
+            cnt = self._fetch8() if op in (0xA4, 0xAC) else self.get_reg8(ECX)
+            cnt &= 31
+            bits = opsize * 8
+            mask = self._mask_of(opsize)
+            dst = self._read_rm(mod, rm, addr, opsize)
+            src = self._read_reg(reg, opsize)
+            if cnt == 0:
+                return
+            if op in (0xA4, 0xA5):                   # shld: 左移, 从 src 高位补入
+                wide = ((dst << bits) | src) & ((1 << (bits * 2)) - 1)
+                res = (wide << cnt) >> bits
+                cf = (dst >> (bits - cnt)) & 1
+            else:                                    # shrd: 右移, 从 src 低位补入
+                wide = ((src << bits) | dst) & ((1 << (bits * 2)) - 1)
+                res = wide >> cnt
+                cf = (dst >> (cnt - 1)) & 1
+            res &= mask
+            self._write_rm(mod, rm, addr, opsize, res)
+            f = EFLAGS_BASE | (self.flags & DF)
+            if cf:
+                f |= CF
+            if res == 0:
+                f |= ZF
+            if res & self._sign_of(opsize):
+                f |= SF
+            f |= _PARITY[res & 0xFF]
+            self.flags = f
+            return
+
         # B6/B7 movzx, BE/BF movsx
         if op in (0xB6, 0xB7, 0xBE, 0xBF):
             src_size = 1 if op in (0xB6, 0xBE) else 2
