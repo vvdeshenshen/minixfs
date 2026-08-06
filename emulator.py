@@ -63,8 +63,11 @@ def _preset_overlay(k: Kernel) -> None:
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="Linux 0.11 用户态仿真器")
     ap.add_argument("image", help="磁盘镜像(裸 minix 或带 MBR)")
-    ap.add_argument("program", nargs="?", default="/bin/init",
-                    help="要运行的程序(默认 /bin/init)")
+    # 默认跑 /bin/sh 而不是 /bin/init: 这个镜像没有 /etc/inittab, init 打不开它
+    # 就直接退出(退出码 1); 即便在覆盖层里合成 inittab, init 的 respawn 循环
+    # 目前也还不能稳定停下。要看完整引导链用 `emulator.py 镜像 /bin/init`。
+    ap.add_argument("program", nargs="?", default="/bin/sh",
+                    help="要运行的程序(默认 /bin/sh; 传 /bin/init 走引导链)")
     # REMAINDER: 程序名之后的一切原样透传, 这样 `ls -l` 的 -l 不会被本脚本吃掉
     ap.add_argument("args", nargs=argparse.REMAINDER,
                     help="传给程序的参数(原样透传)")

@@ -541,6 +541,31 @@ class CPU:
             self.push16(imm & 0xFFFF) if opsize == 2 else self.push32(imm)
             return
 
+        # ---- 69/6B imul r, r/m, imm ----
+        if op in (0x69, 0x6B):
+            mod, reg, rm, addr = self._modrm()
+            src = self._read_rm(mod, rm, addr, opsize)
+            if op == 0x69:
+                imm = self._fetch16() if opsize == 2 else self._fetch32()
+                imm = _sx16(imm) if opsize == 2 else _sx32(imm)
+            else:
+                imm = _sx8(self._fetch8())
+            a = _sx16(src) if opsize == 2 else _sx32(src)
+            res = a * imm
+            self._write_reg(reg, opsize, res)
+            lim = 0x7FFF if opsize == 2 else 0x7FFFFFFF
+            f = EFLAGS_BASE | (self.flags & DF)
+            if not (-lim - 1 <= res <= lim):
+                f |= CF | OF
+            low = res & self._mask_of(opsize)
+            if low == 0:
+                f |= ZF
+            if low & self._sign_of(opsize):
+                f |= SF
+            f |= _PARITY[low & 0xFF]
+            self.flags = f
+            return
+
         # ---- 70-7F jcc rel8 ----
         if 0x70 <= op <= 0x7F:
             rel = _sx8(self._fetch8())

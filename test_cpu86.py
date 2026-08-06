@@ -757,6 +757,37 @@ class TestMulDiv(FlagAsserts):
         self.assertEqual(cpu.regs[EAX], 0xFFFFFFFB)  # -5
         self.assertEqual(cpu.regs[EDX], 0xFFFFFFFF)
 
+    def test_imul_three_operand_imm32(self):
+        """69 /r imm32 —— 真实的 /bin/init 里就用了这条."""
+        cpu = run_code(mov_ri(EBX, 20),
+                       bytes([0x69]) + rr(EAX, EBX) + p32(276))   # imul eax,ebx,276
+        self.assertEqual(cpu.regs[EAX], 20 * 276)
+
+    def test_imul_three_operand_negative_imm(self):
+        cpu = run_code(mov_ri(EBX, 5),
+                       bytes([0x69]) + rr(EAX, EBX) + p32(0xFFFFFFFF))  # imm = -1
+        self.assertEqual(cpu.regs[EAX], 0xFFFFFFFB)               # -5
+
+    def test_imul_three_operand_imm8(self):
+        cpu = run_code(mov_ri(EBX, 7),
+                       bytes([0x6B]) + rr(EAX, EBX) + b"\x03")    # imul eax,ebx,3
+        self.assertEqual(cpu.regs[EAX], 21)
+
+    def test_imul_three_operand_imm8_sign_extends(self):
+        cpu = run_code(mov_ri(EBX, 4),
+                       bytes([0x6B]) + rr(EAX, EBX) + b"\xff")    # imm = -1
+        self.assertEqual(cpu.regs[EAX], 0xFFFFFFFC)               # -4
+
+    def test_imul_three_operand_overflow_flags(self):
+        cpu = run_code(mov_ri(EBX, 0x10000),
+                       bytes([0x69]) + rr(EAX, EBX) + p32(0x10000))
+        self.assertFlags(cpu, cf=1, of=1)
+
+    def test_imul_three_operand_memory_source(self):
+        cpu = run_code(mov_ri(EBP, 0x1000), mov_ri(ECX, 9), mov_mr(EBP, 4, ECX),
+                       bytes([0x6B]) + modrm(1, EAX, EBP) + b"\x04\x02")
+        self.assertEqual(cpu.regs[EAX], 18)
+
     def test_imul_two_operand(self):
         cpu = run_code(mov_ri(EAX, 0xFFFFFFFE), mov_ri(EBX, 3),
                        imul_rr(EAX, EBX))

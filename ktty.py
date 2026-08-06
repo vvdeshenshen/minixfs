@@ -235,9 +235,15 @@ class TTY:
 
     # ---- 输入侧 -------------------------------------------------------
 
-    def pump(self) -> None:
-        """把宿主输入喂进行规程(调度器每轮调用)."""
-        data = self.term.poll_input()
+    def pump(self, timeout: float = 0.0) -> None:
+        """把宿主输入喂进行规程.
+
+        timeout > 0 时阻塞等待(调度器发现全员睡眠时用), 否则非阻塞轮询。
+        注意必须把读到的字节交给 feed —— 早期版本在空闲分支里直接调
+        term.wait_input() 会把输入读走丢弃, 交互模式下敲键毫无反应。
+        """
+        data = self.term.wait_input(timeout) if timeout > 0 \
+            else self.term.poll_input()
         if data:
             self.feed(data)
         elif getattr(self.term, "at_eof", False) and not self.ready:

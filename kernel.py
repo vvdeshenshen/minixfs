@@ -923,8 +923,7 @@ class Kernel:
                 if not any(q.state != ZOMBIE for q in self.procs.values()):
                     break
                 if self.terminal is not None:
-                    self.terminal.term.wait_input(0.02)
-                    self.terminal.pump()
+                    self.terminal.pump(0.02)      # 阻塞等输入并喂给行规程
                 self.jiffies += 2
                 idle += 1
                 if idle > 20000:            # 全员永久睡眠, 无输入可来
