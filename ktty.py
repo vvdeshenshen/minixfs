@@ -134,9 +134,20 @@ class ScriptedTerminal:
     def restore(self) -> None:
         pass
 
+    def suspend(self) -> None:
+        pass
+
+    def resume(self) -> None:
+        pass
+
     @property
     def text(self) -> str:
         return self.out.decode("latin-1")
+
+    @property
+    def text_utf8(self) -> str:
+        """内核自己的消息是 UTF-8(含中文), 用这个视图看."""
+        return self.out.decode("utf-8", "replace")
 
 
 IS_WINDOWS = os.name == "nt"
@@ -240,6 +251,16 @@ class HostTerminal:
             import termios
             termios.tcsetattr(self._fd, termios.TCSADRAIN, self._saved)
             self._raw = False
+
+    def suspend(self) -> None:
+        """暂时恢复宿主终端的常规模式(monitor 要用 input() 读整行)."""
+        self._was_raw = self._raw
+        self.restore()
+
+    def resume(self) -> None:
+        """回到 raw 模式继续仿真."""
+        if getattr(self, "_was_raw", False) and self._is_tty and not IS_WINDOWS:
+            self._enter_raw()
 
     # ---- Windows 管道: 后台读取线程 -------------------------------------
 
@@ -365,7 +386,8 @@ class HostTerminal:
 class TTY:
     """终端行规程: 回显、行编辑、信号字符."""
 
-    def __init__(self, term, post_signal=None):
+    def __init__(self, term, post_signal=None, escape: int = 0x01,
+                 on_escape=None):
         self.term = term
         self.post_signal = post_signal or (lambda pgrp, sig: None)
         self.termios = Termios()
@@ -374,6 +396,11 @@ class TTY:
         self.line = bytearray()          # 正在编辑的行
         self.ready = bytearray()         # 已提交、待 read 的数据
         self.eof_pending = False
+        # 转义键(默认 Ctrl-A, 仿 qemu): 在行规程之前拦截, 所以不受被仿真程序
+        # 的 termios 设置影响 —— raw 模式下的 bash 也照样能用 Ctrl-A x 退出。
+        self.escape = escape
+        self.on_escape = on_escape
+        self._escape_armed = False
         if not term.is_tty():
             # 非交互: 关回显, 免得污染输出
             self.termios.lflag &= ~(ECHO | ECHOE | ECHOK | ECHOCTL)
@@ -395,6 +422,34 @@ class TTY:
             self.eof_pending = True
 
     def feed(self, data: bytes) -> None:
+        if self.on_escape is not None:
+            data = self._strip_escapes(data)
+            if not data:
+                return
+        self._feed_cooked(data)
+
+    def _strip_escapes(self, data: bytes) -> bytes:
+        """抽掉转义键序列, 剩下的才交给行规程.
+
+        Ctrl-A 之后的一个字符是命令; Ctrl-A Ctrl-A(或 Ctrl-A a)表示要发一个
+        真正的 Ctrl-A 给被仿真程序。
+        """
+        out = bytearray()
+        for byte in data:
+            if self._escape_armed:
+                self._escape_armed = False
+                if byte in (self.escape, ord("a"), ord("A")):
+                    out.append(self.escape)      # 透传一个真正的转义键
+                else:
+                    self.on_escape(bytes((byte,)))
+                continue
+            if byte == self.escape:
+                self._escape_armed = True
+                continue
+            out.append(byte)
+        return bytes(out)
+
+    def _feed_cooked(self, data: bytes) -> None:
         t = self.termios
         canon = bool(t.lflag & ICANON)
         for byte in data:

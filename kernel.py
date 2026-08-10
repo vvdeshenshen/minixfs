@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import time
+from collections import Counter, deque
 from typing import Dict, List, Optional
 
 import ksyscall
@@ -146,6 +147,12 @@ class Kernel:
         self.init_proc: Optional[Process] = None
         self._init_state = "done"
         self._init_child = 0
+        # monitor 与统计
+        self.quit_requested = False
+        self.monitor_pending = False
+        self.monitor = None
+        self.syscall_counts = Counter()
+        self.recent_syscalls = deque(maxlen=200)
 
     # ---- 进程创建 -----------------------------------------------------
 
@@ -207,9 +214,20 @@ class Kernel:
             ret = -e.errno
         except SegFault:
             ret = -kvfs.EFAULT
+        self._on_int_stats(p, nr, a, b, c, ret)
+        regs[0] = ret & 0xFFFFFFFF
+
+    def _on_int_stats(self, p, nr: int, a: int, b: int, c: int,
+                      ret: int) -> None:
+        """记一次系统调用, 供 monitor 的 `info syscalls` 用.
+
+        系统调用相对指令数极稀疏(几千 vs 几百万), 一次 dict 自增可忽略,
+        所以统计常开而不必等 --trace。
+        """
+        self.syscall_counts[nr] += 1
+        self.recent_syscalls.append((p.pid, nr, a, b, c, ret))
         if self.verbose:
             self.trace.append(f"sys {nr}({a:#x},{b:#x},{c:#x}) = {ret}")
-        regs[0] = ret & 0xFFFFFFFF
 
     def _on_fault(self, cpu: CPU, exc: BaseException) -> None:
         kind = "除零" if isinstance(exc, DivideError) else "段错误"
@@ -978,7 +996,7 @@ class Kernel:
                     del self.procs[child.pid]
                     if was_shell:
                         self._write_console(
-                            f"\r\nchild {child.pid} died with code {code:04x}\r\n")
+                            f"\nchild {child.pid} died with code {code:04x}\n")
                 # 真机上控制台不会 EOF, 所以 init 无限重启 shell 是对的; 但输入是
                 # 管道/脚本时耗尽后再重启只会空转, 此时就地收场。
                 self._init_state = "shell" if (not was_shell or
@@ -1010,9 +1028,27 @@ class Kernel:
             return False
         return bool(getattr(term, "pending", None)) or bool(self.terminal.ready)
 
+    def on_escape(self, ch: bytes) -> None:
+        """处理转义键(默认 Ctrl-A)之后的命令字符, 仿 qemu 的 Ctrl-A 前缀."""
+        import kmonitor
+
+        low = ch.lower()
+        if low == b"x":
+            self.quit_requested = True
+            self._write_console("\n仿真器退出。\n")
+        elif low == b"c":
+            self.monitor_pending = True
+        elif low in (b"?", b"h"):
+            self._write_console("\n" + kmonitor.ESCAPE_HELP)
+
     def _write_console(self, text: str) -> None:
+        """向控制台写内核自己的消息.
+
+        用 UTF-8 而不是 latin-1: 这些消息含中文, latin-1 编不出来。UTF-8 的
+        续字节都 >= 0x80, 不会和 ONLCR 的换行处理撞车。
+        """
         if self.terminal is not None:
-            self.terminal.write(text.encode("latin-1"))
+            self.terminal.write(text.encode("utf-8", "replace"))
 
     # ---- 调度 ---------------------------------------------------------
 
@@ -1046,6 +1082,14 @@ class Kernel:
         total = 0
         idle = 0
         while total < max_instructions:
+            if self.quit_requested:
+                return self.exit_status
+            if self.monitor_pending:
+                self.monitor_pending = False
+                if self.monitor is not None:
+                    self.monitor.interact()
+                if self.quit_requested:
+                    return self.exit_status
             self._pump_tty()
             self._check_alarms()
             self._wake_waiters()             # 每轮都查等待条件, 否则两端互等会卡死

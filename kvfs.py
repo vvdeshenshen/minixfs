@@ -462,6 +462,25 @@ class OverlayFS:
         return (ROOT_DEV, v.ino, v.mode, v.nlinks, v.uid, v.gid,
                 v.rdev, v.size, v.mtime, v.mtime, v.mtime)
 
+    def overlay_stats(self) -> dict:
+        """覆盖层用量统计, 供 monitor 的 `info fs` 用."""
+        cow_files = cow_dirs = new_inodes = deleted = nbytes = 0
+        for v in self.vnodes.values():
+            if v.base is None:
+                new_inodes += 1
+            if v.deleted:
+                deleted += 1
+            if v.data is not None:
+                cow_files += 1
+                nbytes += len(v.data)
+            if v.entries is not None:
+                cow_dirs += 1
+                nbytes += len(v.entries) * DIRENT_SIZE
+        return {"cow_files": cow_files, "cow_dirs": cow_dirs,
+                "new_inodes": new_inodes, "deleted": deleted,
+                "bytes": nbytes, "next_ino": self.next_ino,
+                "tracked": len(self.vnodes)}
+
     # ---- 覆盖层导出/导入(--save-overlay) -------------------------------
 
     def export_changes(self) -> dict:

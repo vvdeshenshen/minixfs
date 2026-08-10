@@ -32,6 +32,47 @@ printf 'echo hi | cat\nexit\n' | python3 emulator.py hdc-0.11.img
 `head`、`basename`、`id`、shell 内建与 for 循环、`#!` 脚本。仿真器细节见下方
 [Linux 0.11 仿真器](#linux-011-仿真器)一节。
 
+### monitor 控制台
+
+仿 qemu 的 `Ctrl-A` 前缀。**这也是退出仿真器的方式** —— 交互时宿主终端处于 raw
+模式, `Ctrl-C` 会作为字节交给被仿真进程, 宿主收不到信号。
+
+| 按键 | 作用 |
+|------|------|
+| `Ctrl-A c` | 进入 monitor 控制台 |
+| `Ctrl-A x` | 退出仿真器 |
+| `Ctrl-A a` | 给被仿真程序发一个真正的 `Ctrl-A` |
+| `Ctrl-A ?` | 按键帮助 |
+
+monitor 里可以查看仿真器内部状态:
+
+```
+(minix) ps
+  PID  PPID  PGRP 状态             指令数  等待             程序
+    1     0     1 睡眠         208,878  TTY            /bin/sh
+(minix) info mem
+    1              329.0KB    0x52400    512.0KB    841.0KB /bin/sh
+(minix) info cpu
+  eax=0x00000003  ...  eip=0x00039a42  eflags=0x0202 [-]
+  eip 处字节: cd 80 85 c0 7d 0c f7 d8        <- int 0x80 + errno 处理
+```
+
+| 命令 | 说明 |
+|------|------|
+| `info procs` / `ps` | 进程表: pid/父/进程组/状态/已执行指令数/等待对象 |
+| `info mem` | 各进程的代码+数据+堆、brk、栈与合计 |
+| `info fs` | 覆盖层用量(改过几个文件/目录、新建、删除)与底层镜像统计 |
+| `info syscalls` | 系统调用次数排名与最近 15 次调用(常开, 不需要 --trace) |
+| `info cpu [pid]` / `regs` | 寄存器、标志位、eip 处的机器码字节 |
+| `info fds [pid]` | 文件描述符表(inode/管道/终端、位置、引用数) |
+| `info tty` | 终端与行规程状态、前台进程组、待读字节 |
+| `kill <pid> [信号]` | 给被仿真进程发信号 |
+| `trace on\|off` | 开关系统调用轨迹记录 |
+| `cont` / `quit` | 继续仿真 / 停止仿真并退出 |
+
+`--monitor` 可在启动后先进入 monitor; `--escape none` 关掉转义键(此时只能从
+另一个终端 kill)。
+
 ---
 
 ## 文件系统浏览器

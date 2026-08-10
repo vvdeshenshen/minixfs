@@ -29,6 +29,8 @@ python3 emulator.py hdc-0.11.img
 python3 emulator.py hdc-0.11.img /bin/date
 printf 'echo hi | cat\nexit\n' | python3 emulator.py hdc-0.11.img
 python3 emulator.py hdc-0.11.img /bin/sh --trace     # 打印系统调用轨迹
+python3 emulator.py hdc-0.11.img --monitor           # 启动即进 monitor 控制台
+# 交互时: Ctrl-A c 进 monitor, Ctrl-A x 退出(raw 模式下 Ctrl-C 归被仿真进程)
 ```
 
 无外部依赖, 仅标准库; 无 lint 配置。
@@ -73,6 +75,10 @@ cpu86.py → x86mem.py                              CPU 层不 import minixfs �
   读 /etc/profile)并汇报子进程死亡。已实现为 `Kernel.boot_init()` + `_init_step()`
   状态机(内核任务, `kernel_task=True`, 不占用户态 CPU)。镜像里的 `/bin/init` 是
   后来某软件包的产物, **不在引导链上**, 别再拿它当入口。
+- **退出途径只有转义键**: 交互时宿主终端是 raw 模式, Ctrl-C 会作为字节 0x03 进
+  行规程转成 SIGINT 发给**被仿真进程**, 宿主永远收不到信号 —— 所以 Ctrl-A x 是
+  唯一出路(仿 qemu)。转义键在 `TTY._strip_escapes` 里于行规程**之前**拦截, 这样
+  被仿真程序关掉 ICANON/ISIG(bash 就会)时依然有效。
 - **终端 I/O 必须分平台**: `select` 在 Windows 上只对 socket 有效, 拿控制台句柄调
   会直接失败 —— 早期版本因此在 Windows 下敲键完全没反应。现在 `HostTerminal`
   分三条路: POSIX 用 raw+select, Windows 交互用 `msvcrt.kbhit/getch`,

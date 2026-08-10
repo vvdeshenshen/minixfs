@@ -14,6 +14,7 @@ import pickle
 import sys
 
 import kernel as kmod
+import kmonitor
 import ktty
 from kernel import Kernel
 from kexec import ExecError
@@ -22,15 +23,18 @@ from minixfs import MinixError, MinixFS
 
 
 def build_kernel(image: str, offset=None, scripted_input=None,
-                 verbose: bool = False):
-    """搭起 镜像 -> 覆盖层 -> 终端 -> 内核 这条链."""
+                 verbose: bool = False, escape: int = 0x01):
+    """搭起 镜像 -> 覆盖层 -> 终端 -> 内核 -> monitor 这条链."""
     fs = OverlayFS(MinixFS.open(image, offset=offset))
     if scripted_input is None:
         term = ktty.HostTerminal()
     else:
         term = ktty.ScriptedTerminal(inputs=scripted_input)
-    tty = ktty.TTY(term)
-    k = Kernel(fs, terminal=tty, verbose=verbose)
+    k = Kernel(fs, verbose=verbose)
+    # 转义键回调要指到内核, 所以 TTY 在 Kernel 之后建, 再回填
+    tty = ktty.TTY(term, escape=escape, on_escape=k.on_escape)
+    k.terminal = tty
+    k.monitor = kmonitor.Monitor(k)
     _preset_overlay(k)
     return k, term
 
@@ -79,13 +83,32 @@ def main(argv=None) -> int:
                     help="退出时把覆盖层改动导出到文件")
     ap.add_argument("--load-overlay", metavar="FILE",
                     help="启动时加载之前导出的覆盖层")
+    ap.add_argument("--monitor", action="store_true",
+                    help="启动后先进入 monitor 控制台")
+    ap.add_argument("--escape", metavar="CHAR", default="a",
+                    help="monitor 转义键(默认 a, 即 Ctrl-A); 传 none 关闭")
     a = ap.parse_args(argv)
 
+    if a.escape.lower() in ("none", "off", ""):
+        escape = 0
+    elif len(a.escape) == 1:
+        escape = ord(a.escape.upper()) & 0x1F      # 'a' -> Ctrl-A(0x01)
+    else:
+        print(f"--escape 只接受单个字符或 none: {a.escape}", file=sys.stderr)
+        return 2
+
     try:
-        k, term = build_kernel(a.image, a.offset, verbose=a.trace)
+        k, term = build_kernel(a.image, a.offset, verbose=a.trace,
+                               escape=escape)
     except (OSError, MinixError) as e:
         print(f"打开镜像失败: {e}", file=sys.stderr)
         return 1
+    if escape == 0:
+        k.terminal.on_escape = None                # 关掉转义键
+    elif term.is_tty():
+        name = chr(64 + escape)
+        print(f"[monitor: Ctrl-{name} c 进入控制台, Ctrl-{name} x 退出, "
+              f"Ctrl-{name} ? 帮助]")
 
     if a.load_overlay:
         with open(a.load_overlay, "rb") as f:
@@ -101,6 +124,9 @@ def main(argv=None) -> int:
         term.restore()
         print(f"启动失败: {e}", file=sys.stderr)
         return 1
+
+    if a.monitor:
+        k.monitor_pending = True
 
     try:
         code = k.run(a.max_insns)

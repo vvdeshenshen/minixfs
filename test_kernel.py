@@ -62,12 +62,13 @@ def hello_program(msg: bytes = b"hello\n", exit_code: int = 0) -> bytes:
 
 
 class FakeCPU:
-    """系统调用测试用的 CPU 壳: 只有寄存器与内存."""
+    """系统调用测试用的 CPU 壳: 只有寄存器与内存(不含任何 x86 解码)."""
 
     def __init__(self, mem):
         self.mem = mem
         self.regs = [0] * 8
         self.eip = 0
+        self.eflags = 0x0202       # 与真 CPU 一样有 eflags(monitor 会读它)
         self.icount = 0
         self.halted = False
 
