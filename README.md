@@ -61,17 +61,36 @@ monitor 里可以查看仿真器内部状态:
 |------|------|
 | `info procs` / `ps` | 进程表: pid/父/进程组/状态/已执行指令数/等待对象 |
 | `info mem` | 各进程的代码+数据+堆、brk、栈与合计 |
-| `info fs` | 覆盖层用量(改过几个文件/目录、新建、删除)与底层镜像统计 |
-| `info syscalls` | 系统调用次数排名与最近 15 次调用(常开, 不需要 --trace) |
+| `info fs` | 覆盖层改动明细(**逐条列出路径**、变化类型、inode、大小)与底层镜像统计 |
+| `info syscalls` | 系统调用次数排名 + 最近 10 次调用(常开, 不需要 `--trace`) |
+| `info trace [n]` / `trace show [n]` | 翻看轨迹缓冲里最近 n 条调用(默认 30), 负返回值标出 errno 名 |
 | `info cpu [pid]` / `regs` | 寄存器、标志位、eip 处的机器码字节 |
 | `info fds [pid]` | 文件描述符表(inode/管道/终端、位置、引用数) |
 | `info tty` | 终端与行规程状态、前台进程组、待读字节 |
 | `kill <pid> [信号]` | 给被仿真进程发信号 |
-| `trace on\|off` | 开关系统调用轨迹记录 |
+| `trace on [容量]` | 放大轨迹缓冲以留更长历史(默认 5000 条) |
+| `trace off` | 缩回默认容量(轨迹**始终在记**, 只是历史更短) |
 | `cont` / `quit` | 继续仿真 / 停止仿真并退出 |
 
+`info fs` 会把改动逐条列出来:
+
+```
+(minix) info fs
+  被改动的文件 5 个, 被改动的目录 4 个, 新建 5 个, 已删除 1 个
+  改动明细(10 项):
+    变化        inode   大小  路径
+    改过的目录     75   272B  /etc
+    改过的文件     76    57B  /etc/rc
+    已删除         79    11B  /etc/mtab
+    新建        20670  2.9KB  /tmp/newfile
+```
+
 `--monitor` 可在启动后先进入 monitor; `--escape none` 关掉转义键(此时只能从
-另一个终端 kill)。
+另一个终端 kill); `--trace` 放大轨迹缓冲并在退出时转储到 stderr。
+
+**注意选项位置**: 程序名之后的一切都原样透传给被仿真程序(好让 `ls -l` 的 `-l`
+不被吃掉), 所以仿真器自己的选项要写在程序名**之前**:
+`emulator.py 镜像 --trace /bin/date`, 不是 `emulator.py 镜像 /bin/date --trace`。
 
 ---
 

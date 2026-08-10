@@ -228,12 +228,77 @@ class TestMonitorCommands(unittest.TestCase):
         self.assertEqual(Monitor.syscall_name(4), "write")
         self.assertEqual(Monitor.syscall_name(999), "#999")
 
-    def test_trace_toggle(self):
-        self.assertIn("已开启", run_monitor(self.k, ["trace on"]))
-        self.assertTrue(self.k.verbose)
-        self.assertIn("已关闭", run_monitor(self.k, ["trace off"]))
-        self.assertFalse(self.k.verbose)
-        self.assertIn("用法", run_monitor(self.k, ["trace bogus"]))
+    def test_trace_on_off_adjusts_capacity(self):
+        """轨迹只有一份环形缓冲且常开, on/off 调的是容量而不是开关."""
+        self.assertEqual(self.k.trace_capacity, kmod.TRACE_DEFAULT)
+        out = run_monitor(self.k, ["trace on"])
+        self.assertIn(str(kmod.TRACE_VERBOSE), out)
+        self.assertEqual(self.k.trace_capacity, kmod.TRACE_VERBOSE)
+        out = run_monitor(self.k, ["trace off"])
+        self.assertIn("仍在记录", out)
+        self.assertEqual(self.k.trace_capacity, kmod.TRACE_DEFAULT)
+
+    def test_trace_on_with_explicit_capacity(self):
+        run_monitor(self.k, ["trace on 77"])
+        self.assertEqual(self.k.trace_capacity, 77)
+        self.assertEqual(self.k.recent_syscalls.maxlen, 77)
+
+    def test_trace_capacity_change_keeps_recent_records(self):
+        import ksyscall
+        for i in range(10):
+            self.k._on_int_stats(self.p, ksyscall.NR_GETPID, i, 0, 0, i)
+        self.k.set_trace_capacity(3)
+        self.assertEqual(len(self.k.recent_syscalls), 3)
+        # 保留的是最后 3 条
+        self.assertEqual([r[2] for r in self.k.recent_syscalls], [7, 8, 9])
+
+    def test_trace_no_args_shows_usage_and_state(self):
+        out = run_monitor(self.k, ["trace"])
+        self.assertIn("用法", out)
+        self.assertIn(str(self.k.trace_capacity), out)
+
+    def test_trace_bad_subcommand_and_args(self):
+        self.assertIn("未知的 trace 子命令", run_monitor(self.k, ["trace bogus"]))
+        self.assertIn("必须是整数", run_monitor(self.k, ["trace show abc"]))
+        self.assertIn("必须是整数", run_monitor(self.k, ["trace on abc"]))
+
+    def test_trace_show_lists_records(self):
+        import ksyscall
+        self.k._on_int_stats(self.p, ksyscall.NR_WRITE, 1, 0x100, 5, 5)
+        self.k._on_int_stats(self.p, ksyscall.NR_OPEN, 0x200, 0, 0, -2)
+        out = run_monitor(self.k, ["trace show"])
+        self.assertIn("write", out)
+        self.assertIn("open", out)
+        self.assertIn(str(self.p.pid), out)
+
+    def test_trace_show_respects_count(self):
+        import ksyscall
+        for i in range(20):
+            self.k._on_int_stats(self.p, ksyscall.NR_GETPID, 0, 0, 0, i)
+        out = run_monitor(self.k, ["trace show 5"])
+        self.assertIn("最近 5 次调用", out)
+
+    def test_info_trace_is_alias(self):
+        import ksyscall
+        for _ in range(3):
+            self.k._on_int_stats(self.p, ksyscall.NR_WRITE, 1, 0, 0, 0)
+        self.assertIn("write", run_monitor(self.k, ["info trace"]))
+        self.assertIn("最近 2 次调用", run_monitor(self.k, ["info trace 2"]))
+
+    def test_trace_show_empty(self):
+        self.assertIn("轨迹缓冲是空的", run_monitor(self.k, ["trace show"]))
+
+    def test_negative_return_shows_errno_name(self):
+        """-2 该标成 -2(ENOENT), 光看数字很难认."""
+        import ksyscall
+        self.k._on_int_stats(self.p, ksyscall.NR_OPEN, 0x100, 0, 0, -2)
+        out = run_monitor(self.k, ["trace show"])
+        self.assertIn("-2(ENOENT)", out)
+
+    def test_kernel_no_longer_has_unbounded_trace_list(self):
+        """旧的无上限 self.trace 列表已删除, 只留有上限的环形缓冲."""
+        self.assertFalse(hasattr(self.k, "trace"))
+        self.assertIsNotNone(self.k.recent_syscalls.maxlen)
 
     # ---- info cpu / fds ----
 
@@ -363,6 +428,205 @@ class TestFmtBytes(unittest.TestCase):
         self.assertEqual(fmt_bytes(512), "512B")
         self.assertEqual(fmt_bytes(2048), "2.0KB")
         self.assertEqual(fmt_bytes(3 * 1024 * 1024), "3.0MB")
+
+
+class TestDisplayWidth(unittest.TestCase):
+    """双宽字符对齐 —— Python 的 f"{s:<5}" 按字符数补齐, 中文会错位."""
+
+    def test_ascii_width_equals_length(self):
+        self.assertEqual(kmonitor.dwidth("abc"), 3)
+        self.assertEqual(kmonitor.dwidth(""), 0)
+
+    def test_cjk_counts_two_columns(self):
+        self.assertEqual(kmonitor.dwidth("状态"), 4)
+        self.assertEqual(kmonitor.dwidth("睡眠"), 4)
+        self.assertEqual(kmonitor.dwidth("a状态b"), 6)
+
+    def test_ljust_rjust_pad_by_columns(self):
+        self.assertEqual(kmonitor.dwidth(kmonitor.ljust("状态", 8)), 8)
+        self.assertEqual(kmonitor.dwidth(kmonitor.rjust("睡眠", 8)), 8)
+        self.assertTrue(kmonitor.ljust("状态", 8).startswith("状态"))
+        self.assertTrue(kmonitor.rjust("睡眠", 8).endswith("睡眠"))
+
+    def test_no_padding_when_already_wide_enough(self):
+        self.assertEqual(kmonitor.ljust("状态", 2), "状态")
+
+    def test_table_columns_line_up(self):
+        """同一列在各行必须从同一个显示列开始 —— 这是原来错位的病根.
+
+        做法: 每行第 2 列放同一个标记串, 断言它前面的内容显示宽度一致。
+        """
+        mark = "@@"
+        lines = kmonitor.table(("状态", mark), [("睡眠", mark), ("运行", mark),
+                                               ("停止", mark)])
+        prefixes = {kmonitor.dwidth(line[:line.index(mark)]) for line in lines}
+        self.assertEqual(len(prefixes), 1,
+                         f"标记列的起始显示位置不一致: {prefixes}")
+
+    def test_table_with_cjk_and_ascii_mixed(self):
+        mark = "@@"
+        lines = kmonitor.table(("prog", mark),
+                               [("/bin/sh", mark), ("中文程序名", mark)])
+        prefixes = {kmonitor.dwidth(line[:line.index(mark)]) for line in lines}
+        self.assertEqual(len(prefixes), 1)
+
+    def test_table_right_align_puts_numbers_flush(self):
+        lines = kmonitor.table(("n",), [("1",), ("1000",)], aligns=["r"])
+        widths = {kmonitor.dwidth(l) for l in lines}
+        self.assertEqual(len(widths), 1)      # 右对齐后各行等宽
+
+    def test_ps_output_program_column_lines_up(self):
+        """真实 ps 输出里, 程序名列在表头与数据行必须从同一显示列开始."""
+        k, term, fs = make_monitored()
+        p = make_proc(k, fs)
+        p.name = "/bin/verylongprogramname"
+        p.state = kmod.SLEEPING              # 中文"睡眠", 双宽
+        out = run_monitor(k, ["ps"])
+        head = next(l for l in out.splitlines() if l.startswith("PID"))
+        data = next(l for l in out.splitlines() if p.name in l)
+        self.assertEqual(kmonitor.dwidth(head[:head.index("程序")]),
+                         kmonitor.dwidth(data[:data.index(p.name)]))
+
+
+class TestInfoFsNames(unittest.TestCase):
+    """info fs 要列出被改动的文件名与目录名."""
+
+    def setUp(self):
+        self.k, self.term, self.fs = make_monitored()
+
+    def test_lists_new_file_with_path(self):
+        self.fs.create("/brand-new.txt", 0o644)
+        out = run_monitor(self.k, ["info fs"])
+        self.assertIn("/brand-new.txt", out)
+        self.assertIn("新建", out)
+
+    def test_lists_modified_file_with_path(self):
+        self.fs.write(self.fs.walk("/hello.txt"), 0, b"changed")
+        out = run_monitor(self.k, ["info fs"])
+        self.assertIn("/hello.txt", out)
+        self.assertIn("改过的文件", out)
+
+    def test_lists_modified_directory(self):
+        self.fs.create("/sub/added", 0o644)
+        out = run_monitor(self.k, ["info fs"])
+        self.assertIn("/sub", out)
+        self.assertIn("改过的目录", out)
+
+    def test_nested_path_is_full(self):
+        self.fs.mkdir("/d1", 0o755)
+        self.fs.mkdir("/d1/d2", 0o755)
+        self.fs.create("/d1/d2/deep.txt", 0o644)
+        self.assertIn("/d1/d2/deep.txt", run_monitor(self.k, ["info fs"]))
+
+    def test_deleted_file_keeps_full_path(self):
+        """删掉的文件已从目录树消失, 靠记下的 (父, 名字) 拼回完整路径 ——
+        否则只剩一个孤零零的文件名, 看不出在哪个目录。"""
+        self.fs.unlink("/sub/note.txt")
+        out = run_monitor(self.k, ["info fs"])
+        self.assertIn("/sub/note.txt", out)
+        self.assertIn("已删除", out)
+
+    def test_changed_paths_returns_structured_rows(self):
+        self.fs.create("/x", 0o644)
+        self.fs.write(self.fs.walk("/x"), 0, b"abc")
+        rows = self.fs.changed_paths()
+        entry = [r for r in rows if r[0] == "/x"]
+        self.assertEqual(len(entry), 1)
+        path, kind, ino, size = entry[0]
+        self.assertEqual(kind, "新建")
+        self.assertEqual(size, 3)
+        self.assertGreater(ino, self.fs.base.sb.ninodes)
+
+    def test_no_changes_lists_nothing(self):
+        out = run_monitor(self.k, ["info fs"])
+        self.assertNotIn("改动明细", out)
+        self.assertEqual(self.fs.changed_paths(), [])
+
+    def test_limit_caps_the_listing(self):
+        for i in range(8):
+            self.fs.create(f"/f{i}", 0o644)
+        out = []
+        mon = Monitor(self.k, write=lambda s: out.append(s))
+        mon.info_fs(limit=3)
+        text = "".join(out)
+        self.assertIn("只列前 3 项", text)
+        self.assertIn("/f0", text)
+        self.assertNotIn("/f7", text)
+
+    def test_rename_shows_up_as_changed_directory(self):
+        """纯改名不动文件内容, 所以体现为父目录被改过(路径为 /)."""
+        self.fs.rename("/hello.txt", "/renamed.txt")
+        out = run_monitor(self.k, ["info fs"])
+        self.assertIn("改过的目录", out)
+        self.assertNotIn("<inode 1>", out)      # 根目录该显示成 /
+
+    def test_root_directory_shown_as_slash(self):
+        self.fs.create("/x", 0o644)
+        rows = self.fs.changed_paths()
+        root_rows = [r for r in rows if r[2] == 1]
+        self.assertEqual(len(root_rows), 1)
+        self.assertEqual(root_rows[0][0], "/")
+
+
+class TestArgvSplit(unittest.TestCase):
+    """命令行拆分: 程序名之后原样透传, 之前归仿真器.
+
+    argparse 的 nargs=REMAINDER 做不到这件事 —— 它会把本该落到 program 的
+    位置参数也吞进 args, 于是 `--trace /bin/date` 会跑成引导链。
+    """
+
+    def split(self, *argv):
+        import emulator
+        return emulator.split_argv(list(argv))
+
+    def test_image_only_runs_boot_chain(self):
+        head, tail = self.split("img")
+        self.assertEqual((head, tail), (["img"], []))
+
+    def test_image_and_program(self):
+        head, tail = self.split("img", "/bin/date")
+        self.assertEqual((head, tail), (["img"], ["/bin/date"]))
+
+    def test_option_before_image(self):
+        head, tail = self.split("--trace", "img", "/bin/date")
+        self.assertEqual((head, tail), (["--trace", "img"], ["/bin/date"]))
+
+    def test_option_between_image_and_program(self):
+        """这条以前是坏的: /bin/date 会被 REMAINDER 吞掉."""
+        head, tail = self.split("img", "--trace", "/bin/date")
+        self.assertEqual((head, tail), (["img", "--trace"], ["/bin/date"]))
+
+    def test_program_options_pass_through(self):
+        head, tail = self.split("img", "/usr/bin/ls", "-l", "/etc")
+        self.assertEqual(head, ["img"])
+        self.assertEqual(tail, ["/usr/bin/ls", "-l", "/etc"])
+
+    def test_option_after_program_goes_to_program(self):
+        """程序名之后的 --trace 是给被仿真程序的, 不归仿真器(有意如此)."""
+        head, tail = self.split("img", "/bin/date", "--trace")
+        self.assertEqual(head, ["img"])
+        self.assertEqual(tail, ["/bin/date", "--trace"])
+
+    def test_value_option_takes_its_value(self):
+        head, tail = self.split("img", "--escape", "b", "/bin/sh")
+        self.assertEqual(head, ["img", "--escape", "b"])
+        self.assertEqual(tail, ["/bin/sh"])
+
+    def test_value_option_before_image(self):
+        head, tail = self.split("--offset", "1024", "img", "/bin/sh")
+        self.assertEqual(head, ["--offset", "1024", "img"])
+        self.assertEqual(tail, ["/bin/sh"])
+
+    def test_multiple_options(self):
+        head, tail = self.split("img", "--trace", "--monitor",
+                                "--max-insns", "999", "/bin/sh", "-c", "x")
+        self.assertEqual(head, ["img", "--trace", "--monitor",
+                                "--max-insns", "999"])
+        self.assertEqual(tail, ["/bin/sh", "-c", "x"])
+
+    def test_bare_dash_is_a_positional(self):
+        head, tail = self.split("img", "-")
+        self.assertEqual(tail, ["-"])
 
 
 if __name__ == "__main__":

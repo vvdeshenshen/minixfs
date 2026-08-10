@@ -28,7 +28,7 @@ printf 'ls -l /bin\nexit\n' | python3 minix_shell.py hdc-0.11.img
 python3 emulator.py hdc-0.11.img
 python3 emulator.py hdc-0.11.img /bin/date
 printf 'echo hi | cat\nexit\n' | python3 emulator.py hdc-0.11.img
-python3 emulator.py hdc-0.11.img /bin/sh --trace     # 打印系统调用轨迹
+python3 emulator.py hdc-0.11.img --trace /bin/date   # 轨迹(选项须在程序名之前!)
 python3 emulator.py hdc-0.11.img --monitor           # 启动即进 monitor 控制台
 # 交互时: Ctrl-A c 进 monitor, Ctrl-A x 退出(raw 模式下 Ctrl-C 归被仿真进程)
 ```
@@ -75,6 +75,15 @@ cpu86.py → x86mem.py                              CPU 层不 import minixfs �
   读 /etc/profile)并汇报子进程死亡。已实现为 `Kernel.boot_init()` + `_init_step()`
   状态机(内核任务, `kernel_task=True`, 不占用户态 CPU)。镜像里的 `/bin/init` 是
   后来某软件包的产物, **不在引导链上**, 别再拿它当入口。
+- **仿真器选项必须写在程序名之前**: `args` 用的是 argparse.REMAINDER, 程序名之后
+  的一切原样透传给被仿真程序(好让 `ls -l` 的 `-l` 不被吃掉), 所以
+  `emulator.py 镜像 /bin/date --trace` 里的 --trace 会被 date 收到并报错。
+- **系统调用轨迹只有一份**: `recent_syscalls` 环形缓冲, 常开, 容量由
+  `set_trace_capacity()` 调(monitor 的 trace on/off 与 --trace 都走它)。
+  早先还并存一个无上限的 `Kernel.trace` 字符串列表, 既不含 pid 又没人读, 已删 ——
+  不要再加回来。
+- **monitor 输出用 kmonitor.table() 排版**: 中文是双宽字符, Python 的 f"{s:<5}"
+  按字符数补齐会让整张表错位, 必须用 dwidth/ljust/rjust 按显示列数算。
 - **退出途径只有转义键**: 交互时宿主终端是 raw 模式, Ctrl-C 会作为字节 0x03 进
   行规程转成 SIGINT 发给**被仿真进程**, 宿主永远收不到信号 —— 所以 Ctrl-A x 是
   唯一出路(仿 qemu)。转义键在 `TTY._strip_escapes` 里于行规程**之前**拦截, 这样

@@ -16,11 +16,24 @@ monitor 里的命令(输入 help 查看):
 
 from __future__ import annotations
 
+import unicodedata
 from typing import Callable, List, Optional
 
+import kernel as kmod
 import kvfs
 
 STATE_NAMES = {0: "运行", 1: "睡眠", 2: "僵尸", 3: "停止"}
+
+# errno 名字(取自镜像 /usr/include/errno.h), 用于把 -2 这类返回值标成 -2(ENOENT)
+ERRNO_NAMES = {
+    1: "EPERM", 2: "ENOENT", 3: "ESRCH", 4: "EINTR", 5: "EIO", 6: "ENXIO",
+    7: "E2BIG", 8: "ENOEXEC", 9: "EBADF", 10: "ECHILD", 11: "EAGAIN",
+    12: "ENOMEM", 13: "EACCES", 14: "EFAULT", 16: "EBUSY", 17: "EEXIST",
+    18: "EXDEV", 19: "ENODEV", 20: "ENOTDIR", 21: "EISDIR", 22: "EINVAL",
+    23: "ENFILE", 24: "EMFILE", 25: "ENOTTY", 26: "ETXTBSY", 27: "EFBIG",
+    28: "ENOSPC", 29: "ESPIPE", 30: "EROFS", 31: "EMLINK", 32: "EPIPE",
+    34: "ERANGE", 38: "ENOSYS", 39: "ENOTEMPTY",
+}
 
 ESCAPE_HELP = """\
 Ctrl-A c   进入 monitor 控制台
@@ -34,13 +47,16 @@ info procs        进程表(pid/父/状态/程序/已执行指令/等待对象)
 info mem          各进程地址空间与堆栈用量
 info fs           覆盖层与底层镜像的文件系统统计
 info syscalls     系统调用次数统计与最近调用
+info trace [n]    翻看轨迹缓冲里最近 n 条调用(默认 30)
 info cpu [pid]    寄存器与标志位
 info fds [pid]    文件描述符表
 info tty          终端与行规程状态
 ps                = info procs
 regs [pid]        = info cpu
 kill <pid> [信号] 给被仿真进程发信号(默认 15/SIGTERM)
-trace on|off      开关系统调用轨迹记录
+trace show [n]    同 info trace
+trace on [容量]   放大轨迹缓冲以留更长历史(默认 5000 条)
+trace off         缩回默认容量(轨迹始终在记, 只是历史更短)
 cont              退出 monitor, 继续仿真
 quit              停止仿真并退出
 help              这份帮助
@@ -54,6 +70,43 @@ def fmt_bytes(n: int) -> str:
     if n < 1024 * 1024:
         return f"{n / 1024:.1f}KB"
     return f"{n / (1024 * 1024):.1f}MB"
+
+
+def dwidth(s: str) -> int:
+    """字符串在终端里占的**显示列数**.
+
+    中文等东亚宽字符一个字符占两列, 而 Python 的 f"{s:<5}" 是按字符数补齐的
+    —— 表头写"状态"(2 字符 / 4 列)时就会少补 2 列, 整张表跟着错位。
+    """
+    return sum(2 if unicodedata.east_asian_width(c) in "WF" else 1 for c in s)
+
+
+def ljust(s: str, n: int) -> str:
+    """按显示列数左对齐."""
+    return s + " " * max(n - dwidth(s), 0)
+
+
+def rjust(s: str, n: int) -> str:
+    """按显示列数右对齐."""
+    return " " * max(n - dwidth(s), 0) + s
+
+
+def table(headers, rows, aligns=None) -> List[str]:
+    """按显示列宽排版一张表, 列宽取表头与各行的最大值.
+
+    aligns: 每列 "l"/"r", 默认全部左对齐。
+    """
+    cols = len(headers)
+    aligns = aligns or ["l"] * cols
+    cells = [[str(c) for c in row] for row in rows]
+    widths = [max([dwidth(headers[i])] +
+                  [dwidth(r[i]) for r in cells]) for i in range(cols)]
+    out = []
+    for row in [list(headers)] + cells:
+        parts = [(rjust if aligns[i] == "r" else ljust)(row[i], widths[i])
+                 for i in range(cols)]
+        out.append("  ".join(parts).rstrip())
+    return out
 
 
 class Monitor:
@@ -144,11 +197,11 @@ class Monitor:
 
     def cmd_info(self, args: List[str]) -> None:
         if not args:
-            self.out("用法: info procs|mem|fs|syscalls|cpu|fds|tty")
+            self.out("用法: info procs|mem|fs|syscalls|trace|cpu|fds|tty")
             return
         what = args[0].lower()
         rest = args[1:]
-        table = {
+        handlers = {
             "procs": lambda: self.info_procs(),
             "proc": lambda: self.info_procs(),
             "mem": lambda: self.info_mem(),
@@ -161,8 +214,10 @@ class Monitor:
             "fds": lambda: self.info_fds(rest),
             "fd": lambda: self.info_fds(rest),
             "tty": lambda: self.info_tty(),
+            "trace": lambda: self.show_trace(
+                int(rest[0]) if rest and rest[0].lstrip("-").isdigit() else 30),
         }
-        fn = table.get(what)
+        fn = handlers.get(what)
         if fn is None:
             self.out(f"未知的 info 项: {what}")
             return
@@ -172,15 +227,17 @@ class Monitor:
 
     def info_procs(self) -> None:
         k = self.k
-        self.out(f"{'PID':>5} {'PPID':>5} {'PGRP':>5} {'状态':<5} "
-                 f"{'指令数':>12}  {'等待':<14} 程序")
+        rows = []
         for pid in sorted(k.procs):
             p = k.procs[pid]
-            state = STATE_NAMES.get(p.state, "?")
             ic = p.cpu.icount if p.cpu is not None else 0
             kind = "(内核任务)" if p.kernel_task else ""
-            self.out(f"{p.pid:>5} {p.ppid:>5} {p.pgrp:>5} {state:<5} "
-                     f"{ic:>12,}  {self._chan(p):<14} {p.name}{kind}")
+            rows.append((p.pid, p.ppid, p.pgrp, STATE_NAMES.get(p.state, "?"),
+                         f"{ic:,}", self._chan(p), f"{p.name}{kind}"))
+        for line in table(("PID", "PPID", "PGRP", "状态", "指令数",
+                           "等待", "程序"), rows,
+                          aligns=["r", "r", "r", "l", "r", "l", "l"]):
+            self.out(line)
         cur = k.current.pid if k.current is not None else "-"
         self.out(f"当前进程: {cur}   jiffies: {k.jiffies}   "
                  f"运行队列: {k.runq}   init 状态: {k._init_state}")
@@ -201,26 +258,27 @@ class Monitor:
 
     def info_mem(self) -> None:
         k = self.k
-        self.out(f"{'PID':>5} {'低区(代码+数据+堆)':>20} {'brk':>10} "
-                 f"{'栈':>10} {'合计':>10} 程序")
+        rows = []
         total = 0
         for pid in sorted(k.procs):
             p = k.procs[pid]
             m = p.mem
             if m is None:
                 continue
-            low = m.low_end
-            stack = len(m.stack)
+            low, stack = m.low_end, len(m.stack)
             tot = low + stack
             total += tot
-            self.out(f"{p.pid:>5} {fmt_bytes(low):>20} {m.brk:>#10x} "
-                     f"{fmt_bytes(stack):>10} {fmt_bytes(tot):>10} {p.name}")
+            rows.append((p.pid, fmt_bytes(low), f"{m.brk:#x}",
+                         fmt_bytes(stack), fmt_bytes(tot), p.name))
+        for line in table(("PID", "代码+数据+堆", "brk", "栈", "合计", "程序"),
+                          rows, aligns=["r", "r", "r", "r", "r", "l"]):
+            self.out(line)
         self.out(f"全部进程合计 {fmt_bytes(total)}; "
                  f"用户空间上限 {fmt_bytes(0x4000000)}/进程(内核 change_ldt)")
 
     # ---- 文件系统 -----------------------------------------------------
 
-    def info_fs(self) -> None:
+    def info_fs(self, limit: int = 40) -> None:
         fs = self.k.fs
         st = fs.overlay_stats()
         self.out("覆盖层(全部改动只在内存里, 镜像文件永不被写):")
@@ -229,6 +287,15 @@ class Monitor:
                  f"新建 {st['new_inodes']} 个, 已删除 {st['deleted']} 个")
         self.out(f"  覆盖层占用内存 {fmt_bytes(st['bytes'])}; "
                  f"下一个新 inode 号 {st['next_ino']}")
+        rows = fs.changed_paths()
+        if rows:
+            self.out(f"  改动明细({len(rows)} 项"
+                     f"{f', 只列前 {limit} 项' if len(rows) > limit else ''}):")
+            body = [(kind, ino, fmt_bytes(size), path)
+                    for path, kind, ino, size in rows[:limit]]
+            for line in table(("变化", "inode", "大小", "路径"), body,
+                              aligns=["l", "r", "r", "l"]):
+                self.out("    " + line)
         base = fs.base.fs_stats()
         sb = fs.base.sb
         ip = base["used_inodes"] / base["total_inodes"] * 100
@@ -250,14 +317,36 @@ class Monitor:
             return
         total = sum(counts.values())
         self.out(f"系统调用共 {total} 次, 按次数排序:")
-        for nr, n in sorted(counts.items(), key=lambda kv: -kv[1])[:20]:
-            self.out(f"  {nr:>3} {self.syscall_name(nr):<12} {n:>8}")
-        if k.recent_syscalls:
-            self.out(f"最近 {min(len(k.recent_syscalls), 15)} 次调用:")
-            for pid, nr, a, b, c, ret in list(k.recent_syscalls)[-15:]:
-                self.out(f"  pid={pid:<4} {self.syscall_name(nr):<10} "
-                         f"({a:#x}, {b:#x}, {c:#x}) = {ret}")
-        self.out(f"轨迹记录: {'开' if k.verbose else '关'}(用 trace on|off 切换)")
+        rows = [(nr, self.syscall_name(nr), f"{n:,}")
+                for nr, n in sorted(counts.items(), key=lambda kv: -kv[1])[:20]]
+        for line in table(("号", "名字", "次数"), rows,
+                          aligns=["r", "l", "r"]):
+            self.out("  " + line)
+        self.show_trace(10)
+        self.out(f"轨迹缓冲: 已存 {len(k.recent_syscalls)}/{k.trace_capacity} 条"
+                 f"(trace show [n] 翻看, trace on|off 调容量)")
+
+    def show_trace(self, n: int = 30) -> None:
+        """翻看轨迹缓冲里最近的 n 条调用."""
+        k = self.k
+        if not k.recent_syscalls:
+            self.out("轨迹缓冲是空的(还没有系统调用)。")
+            return
+        recs = list(k.recent_syscalls)[-max(n, 1):]
+        self.out(f"最近 {len(recs)} 次调用(共存了 {len(k.recent_syscalls)} 条):")
+        rows = [(pid, self.syscall_name(nr),
+                 f"{a:#x}", f"{b:#x}", f"{c:#x}", self._fmt_ret(ret))
+                for pid, nr, a, b, c, ret in recs]
+        for line in table(("pid", "调用", "参数1", "参数2", "参数3", "返回"),
+                          rows, aligns=["r", "l", "r", "r", "r", "r"]):
+            self.out("  " + line)
+
+    @staticmethod
+    def _fmt_ret(ret: int) -> str:
+        """负返回值是 -errno, 顺手标出 errno 名字."""
+        if -40 < ret < 0:
+            return f"{ret}({ERRNO_NAMES.get(-ret, '?')})"
+        return str(ret)
 
     @staticmethod
     def syscall_name(nr: int) -> str:
@@ -385,8 +474,45 @@ class Monitor:
         self.out(f"已向 pid {pid}({p.name}) 投递信号 {sig}")
 
     def cmd_trace(self, args: List[str]) -> None:
-        if not args or args[0] not in ("on", "off"):
-            self.out(f"用法: trace on|off(当前: {'开' if self.k.verbose else '关'})")
+        """trace show [n] | trace on [容量] | trace off.
+
+        轨迹本身是常开的(只有一份环形缓冲), on/off 调的是容量:
+        on 把缓冲放大以便留更长历史, off 缩回默认值。
+        """
+        k = self.k
+        if not args:
+            self.out(f"用法: trace show [n] | trace on [容量] | trace off"
+                     f"(当前容量 {k.trace_capacity}, 已存 "
+                     f"{len(k.recent_syscalls)} 条)")
             return
-        self.k.verbose = args[0] == "on"
-        self.out(f"系统调用轨迹已{'开启' if self.k.verbose else '关闭'}")
+        sub = args[0].lower()
+        if sub in ("show", "list", "dump"):
+            n = 30
+            if len(args) > 1:
+                try:
+                    n = int(args[1])
+                except ValueError:
+                    self.out(f"条数必须是整数: {args[1]}")
+                    return
+            self.show_trace(n)
+            return
+        if sub == "on":
+            cap = kmod.TRACE_VERBOSE
+            if len(args) > 1:
+                try:
+                    cap = int(args[1])
+                except ValueError:
+                    self.out(f"容量必须是整数: {args[1]}")
+                    return
+            k.set_trace_capacity(cap)
+            k.verbose = True
+            self.out(f"轨迹缓冲容量已设为 {k.trace_capacity} 条"
+                     f"(退出时也会把它转储到 stderr)")
+            return
+        if sub == "off":
+            k.set_trace_capacity(kmod.TRACE_DEFAULT)
+            k.verbose = False
+            self.out(f"轨迹缓冲容量已缩回 {k.trace_capacity} 条"
+                     f"(仍在记录, 只是历史更短)")
+            return
+        self.out(f"未知的 trace 子命令: {sub}")

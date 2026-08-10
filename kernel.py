@@ -27,6 +27,9 @@ from kvfs import (EACCES, EBADF, EEXIST, EINVAL, EISDIR, ENOENT, ENOSYS,
                   Pipe, VInode)
 from x86mem import AddressSpace, SegFault
 
+TRACE_DEFAULT = 200       # 轨迹环形缓冲默认容量
+TRACE_VERBOSE = 5000      # trace on / --trace 时的容量
+
 NR_OPEN = 20              # 内核 include/linux/fs.h: 每进程最多 20 个 fd
 HZ = 100
 TIMESLICE = 100_000       # 一个时间片的指令数, 约折算 10ms
@@ -142,7 +145,6 @@ class Kernel:
         self.syscalls = SyscallTable(self)
         self.current: Optional[Process] = None
         self.exit_status = 0
-        self.trace: List[str] = []
         self.runq: List[int] = []
         self.init_proc: Optional[Process] = None
         self._init_state = "done"
@@ -152,7 +154,10 @@ class Kernel:
         self.monitor_pending = False
         self.monitor = None
         self.syscall_counts = Counter()
-        self.recent_syscalls = deque(maxlen=200)
+        # 系统调用轨迹: 唯一的一份记录, 常开, 环形缓冲(容量可用 trace 命令调)。
+        # 早先还并存一个无上限的 self.trace 列表, 但它不含 pid 且没人读, 已删。
+        self.trace_capacity = TRACE_DEFAULT
+        self.recent_syscalls = deque(maxlen=TRACE_DEFAULT)
 
     # ---- 进程创建 -----------------------------------------------------
 
@@ -226,8 +231,12 @@ class Kernel:
         """
         self.syscall_counts[nr] += 1
         self.recent_syscalls.append((p.pid, nr, a, b, c, ret))
-        if self.verbose:
-            self.trace.append(f"sys {nr}({a:#x},{b:#x},{c:#x}) = {ret}")
+
+    def set_trace_capacity(self, n: int) -> None:
+        """调整轨迹环形缓冲容量, 保留已有记录的尾部."""
+        n = max(int(n), 1)
+        self.trace_capacity = n
+        self.recent_syscalls = deque(self.recent_syscalls, maxlen=n)
 
     def _on_fault(self, cpu: CPU, exc: BaseException) -> None:
         kind = "除零" if isinstance(exc, DivideError) else "段错误"

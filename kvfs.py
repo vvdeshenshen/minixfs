@@ -166,6 +166,11 @@ class OverlayFS:
     def __init__(self, base: MinixFS):
         self.base = base
         self.vnodes: Dict[int, VInode] = {}
+        # ino -> (父目录 ino, 名字)。只在本来就带路径的操作里记, 用于给
+        # monitor 的 info fs 兜底那些已从目录树消失的项(删掉的/改名走的)。
+        # 记父 ino 而不是拼好的字符串, 这样报告时能用遍历到的父目录路径拼出
+        # 完整路径(否则删掉的文件只剩个孤零零的文件名)。
+        self.names: Dict[int, Tuple[int, str]] = {}
         self.next_ino = base.sb.ninodes + 1        # 新 inode 从镜像上限之后取
         self.root = self.get(1)
 
@@ -329,6 +334,10 @@ class OverlayFS:
 
     # ---- 目录项操作 ---------------------------------------------------
 
+    def _remember(self, parent: VInode, name: str, v: VInode) -> None:
+        """记下 (父目录, 名字), 供 changed_paths 拼完整路径."""
+        self.names[v.ino] = (parent.ino, name)
+
     def _link_entry(self, parent: VInode, name: str, v: VInode) -> None:
         entries = self._cow_dir(parent)
         entries[name] = v.ino
@@ -341,6 +350,7 @@ class OverlayFS:
         if ino is None:
             raise FsError(ENOENT, f"'{name}' 不存在")
         v = self.get(ino)
+        self._remember(parent, name, v)
         del entries[name]
         v.nlinks = max(v.nlinks - 1, 0)
         parent.mtime = int(time.time())
@@ -355,6 +365,7 @@ class OverlayFS:
             raise FsError(EEXIST, f"'{name}' 已存在")
         v = self._new_inode((mode & 0o7777) | _stat.S_IFREG, uid, gid)
         self._link_entry(parent, name, v)
+        self._remember(parent, name, v)
         return v
 
     def mknod(self, path: str, mode: int, rdev: int, cwd=None, root=None,
@@ -366,6 +377,7 @@ class OverlayFS:
         if not (v.is_device or v.is_fifo):
             v.data = bytearray()
         self._link_entry(parent, name, v)
+        self._remember(parent, name, v)
         return v
 
     def mkdir(self, path: str, mode: int, cwd=None, root=None,
@@ -382,6 +394,7 @@ class OverlayFS:
         v.entries[".."] = parent.ino
         parent.nlinks += 1
         self._link_entry(parent, name, v)
+        self._remember(parent, name, v)
         return v
 
     def rmdir(self, path: str, cwd=None, root=None) -> None:
@@ -461,6 +474,72 @@ class OverlayFS:
         """
         return (ROOT_DEV, v.ino, v.mode, v.nlinks, v.uid, v.gid,
                 v.rdev, v.size, v.mtime, v.mtime, v.mtime)
+
+    def _changed_inodes(self) -> Dict[int, str]:
+        """被改动过的 inode -> 变化类型."""
+        out = {}
+        for ino, v in self.vnodes.items():
+            if v.deleted:
+                out[ino] = "已删除"
+            elif v.base is None:
+                out[ino] = "新建"
+            elif v.entries is not None:
+                out[ino] = "改过的目录"
+            elif v.data is not None:
+                out[ino] = "改过的文件"
+        return out
+
+    def changed_paths(self) -> List[Tuple[str, str, int, int]]:
+        """列出被改动的路径, 返回 [(路径, 变化类型, inode 号, 大小), ...].
+
+        名字有两个来源: 一是从根遍历目录树反查(能拿到当前的真实路径),
+        二是 self.names —— 在 create/mkdir/mknod/unlink/rmdir/rename 这些
+        本来就带路径的操作里顺手记下的, 用于兜底已经从目录树里消失的项
+        (删掉的、改名走的)。
+        """
+        changed = self._changed_inodes()
+        if not changed:
+            return []
+        found = {self.root.ino: "/"}             # 根目录自己没有父项可反查
+        dir_paths = {self.root.ino: ""}          # 目录 ino -> 路径, 用于拼父路径
+        stack = [("", self.root)]
+        seen = {self.root.ino}
+        while stack:
+            prefix, dirv = stack.pop()
+            try:
+                entries = self.list_dir(dirv)
+            except (FsError, MinixError):
+                continue
+            for ino, name in entries:
+                if name in (".", ".."):
+                    continue
+                path = f"{prefix}/{name}"
+                if ino in changed and ino not in found:
+                    found[ino] = path
+                if ino in seen:
+                    continue
+                try:
+                    child = self.get(ino)
+                except FsError:
+                    continue
+                if child.is_dir:
+                    seen.add(ino)
+                    dir_paths[ino] = path
+                    stack.append((path, child))
+        rows = []
+        for ino, kind in sorted(changed.items()):
+            path = found.get(ino)
+            if path is None:
+                # 已从目录树消失(删掉的/改名走的): 用记下的 (父, 名字) 拼
+                rec = self.names.get(ino)
+                if rec is not None:
+                    parent_ino, name = rec
+                    base = dir_paths.get(parent_ino)
+                    path = f"{base}/{name}" if base is not None else name
+                else:
+                    path = f"<inode {ino}>"
+            rows.append((path, kind, ino, self.vnodes[ino].size))
+        return rows
 
     def overlay_stats(self) -> dict:
         """覆盖层用量统计, 供 monitor 的 `info fs` 用."""
