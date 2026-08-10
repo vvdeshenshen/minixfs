@@ -499,8 +499,8 @@ class TestRealImageOverlay(unittest.TestCase):
         data = self.ov.read(self.ov.walk("/etc/rc"), 0, 100)
         self.assertIn(b"/etc/update", data)
 
-    def test_synthesize_dev_console(self):
-        """镜像里没有 /dev/console, 引导时要在覆盖层合成一个."""
+    def test_mknod_device_in_overlay(self):
+        """覆盖层能新建设备节点(镜像里没有 /dev/console 就临时造一个来测)."""
         with self.assertRaises(FsError):
             self.ov.walk("/dev/console")
         v = self.ov.mknod("/dev/console", 0o020600, (5 << 8) | 0)

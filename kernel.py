@@ -15,16 +15,14 @@ import time
 from collections import Counter, deque
 from typing import Dict, List, Optional
 
-import ksyscall
 import kvfs
 from cpu86 import CPU, DivideError, MagicJump
 from kexec import ExecError, load_aout, resolve_exec, setup_stack
 from ksyscall import (SEEK_CUR, SEEK_END, SEEK_SET, UTSNAME_FIELDS, Blocked,
                       SyscallTable, pack_stat)
-from kvfs import (EACCES, EBADF, EEXIST, EINVAL, EISDIR, ENOENT, ENOSYS,
-                  ENOTDIR, ENOTTY, EPERM, ESPIPE, FsError, O_ACCMODE,
-                  O_APPEND, O_CREAT, O_EXCL, O_TRUNC, O_WRONLY, OverlayFS,
-                  Pipe, VInode)
+from kvfs import (EBADF, EEXIST, EINVAL, EISDIR, ENOENT, ENOSYS, ENOTDIR,
+                  ENOTTY, EPERM, ESPIPE, FsError, O_ACCMODE, O_APPEND,
+                  O_CREAT, O_EXCL, O_TRUNC, O_WRONLY, OverlayFS, Pipe, VInode)
 from x86mem import AddressSpace, SegFault
 
 TRACE_DEFAULT = 200       # 轨迹环形缓冲默认容量
@@ -88,7 +86,6 @@ class Process:
         self.close_on_exec = 0
         self.cwd: Optional[VInode] = None
         self.root: Optional[VInode] = None
-        self.cwd_path = "/"
         self.umask = 0o022
         self.uid = self.euid = self.suid = 0
         self.gid = self.egid = self.sgid = 0
@@ -97,7 +94,6 @@ class Process:
         self.sigactions = [(0, 0, 0, 0)] * 33
         self.exit_code = 0
         self.wait_channel = None
-        self.tty = None
         self.alarm_at = 0
         self.utime = self.stime = 0
         self.cutime = self.cstime = 0
@@ -133,10 +129,9 @@ class Replaced(Exception):
 class Kernel:
     """仿真内核."""
 
-    def __init__(self, fs: OverlayFS, terminal=None, verbose: bool = False):
+    def __init__(self, fs: OverlayFS, terminal=None):
         self.fs = fs
         self.terminal = terminal
-        self.verbose = verbose
         self.procs: Dict[int, Process] = {}
         self.next_pid = 1
         self.jiffies = 0
@@ -170,9 +165,9 @@ class Kernel:
         self.procs[pid] = p
         return p
 
-    def boot(self, path: str = "/bin/init", argv: Optional[List[bytes]] = None,
+    def boot(self, path: str, argv: Optional[List[bytes]] = None,
              envp: Optional[List[bytes]] = None) -> Process:
-        """装入第一个进程."""
+        """装入并运行单个程序(完整引导用 boot_init)."""
         argv = argv or [path.encode()]
         envp = envp or [b"HOME=/root", b"PATH=/bin:/usr/bin", b"TERM=console"]
         p = self._new_process()
@@ -191,8 +186,8 @@ class Kernel:
     def _setup_std_fds(self, p: Process) -> None:
         """给 fd 0/1/2 接上终端.
 
-        镜像里没有 /dev/console —— init 打开它会 ENOENT, 真机上靠继承内核
-        给的 fd 0/1/2 工作, 我们照此直接把终端塞进这三个 fd。
+        等价于内核 init() 里的 open("/dev/tty0") + dup(0) + dup(0),
+        只是不走路径查找, 直接把终端对象塞进这三个 fd。
         """
         if self.terminal is None:
             return
@@ -714,7 +709,6 @@ class Kernel:
         child.gid, child.egid, child.sgid = p.gid, p.egid, p.sgid
         child.blocked = p.blocked
         child.sigactions = list(p.sigactions)
-        child.tty = p.tty
         child.close_on_exec = p.close_on_exec
         child.name = p.name
         # fd 表逐项复制但指向同一 OpenFile —— fork 后共享文件位置,
@@ -898,7 +892,6 @@ class Kernel:
         p.leader = True
         p.session = p.pid
         p.pgrp = p.pid
-        p.tty = None
         return p.pgrp
 
     def sys_setpgid(self, p, pid, pgid, c):

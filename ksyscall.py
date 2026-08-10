@@ -10,14 +10,9 @@ sigsuspend/setrlimit/getrlimit/lstat/readlink 等, 而镜像里的 libc 正好
 from __future__ import annotations
 
 import struct
-import time
-from typing import Callable, Dict, Optional
+from typing import Callable, Dict
 
-import kvfs
-from kvfs import (EACCES, EBADF, EEXIST, EINVAL, EISDIR, ENOENT, ENOSYS,
-                  ENOTDIR, ENOTTY, EPERM, ESPIPE, FsError, O_ACCMODE,
-                  O_APPEND, O_CREAT, O_EXCL, O_RDONLY, O_TRUNC, O_WRONLY)
-from x86mem import SegFault
+from kvfs import ENOSYS
 
 # ---- 调用号(镜像内核 sys_call_table 的顺序) ----
 NR_SETUP, NR_EXIT, NR_FORK, NR_READ, NR_WRITE, NR_OPEN, NR_CLOSE = range(7)

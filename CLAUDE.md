@@ -52,7 +52,8 @@ cpu86.py → x86mem.py                              CPU 层不 import minixfs �
   标记、重复引用、孤儿与丢失块。
 - **minix_shell.py** — 基于 `cmd.Cmd` 的交互层, 只负责参数解析与格式化。
   `MinixError` 统一在 `onecmd()` 里捕获。当前目录状态是 `cwd`(Inode) +
-  `cwd_path`(显示用规范化字符串)两份。
+  `cwd_path`(显示用规范化字符串)两份。(这说的是文件系统浏览器 minix_shell.py;
+  仿真器里的进程 cwd 只是个 VInode, 不留字符串路径。)
 - **pager.py** — 独立的 less 风格分页器。`Pager` 的终端尺寸/按键读取/
   写出全部可注入; `read_key` 为 None 时非交互直接输出。tty 按键经
   `_decode_key` 把方向键等 ESC 序列翻译成 j/k/f/b。

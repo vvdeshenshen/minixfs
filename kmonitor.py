@@ -117,7 +117,6 @@ class Monitor:
         self.k = kernel
         self._read_line = read_line
         self._write = write
-        self.entered = 0
 
     # ---- 输入输出(可注入) ----------------------------------------------
 
@@ -139,7 +138,6 @@ class Monitor:
 
     def interact(self) -> None:
         """进入 monitor, 直到用户 cont 或 quit."""
-        self.entered += 1
         term = getattr(self.k.terminal, "term", None)
         if term is not None and hasattr(term, "suspend"):
             term.suspend()                 # 暂时恢复宿主终端的常规模式
@@ -252,7 +250,7 @@ class Monitor:
                 pipe = ch[1]
                 return f"{ch[0]}({len(pipe.buf)}B)"
             return str(ch[0])
-        return "tty" if ch is getattr(p, "tty", None) else type(ch).__name__
+        return type(ch).__name__
 
     # ---- 内存 ---------------------------------------------------------
 
@@ -505,13 +503,10 @@ class Monitor:
                     self.out(f"容量必须是整数: {args[1]}")
                     return
             k.set_trace_capacity(cap)
-            k.verbose = True
-            self.out(f"轨迹缓冲容量已设为 {k.trace_capacity} 条"
-                     f"(退出时也会把它转储到 stderr)")
+            self.out(f"轨迹缓冲容量已设为 {k.trace_capacity} 条")
             return
         if sub == "off":
             k.set_trace_capacity(kmod.TRACE_DEFAULT)
-            k.verbose = False
             self.out(f"轨迹缓冲容量已缩回 {k.trace_capacity} 条"
                      f"(仍在记录, 只是历史更短)")
             return

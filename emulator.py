@@ -23,45 +23,24 @@ from minixfs import MinixError, MinixFS
 
 
 def build_kernel(image: str, offset=None, scripted_input=None,
-                 verbose: bool = False, escape: int = 0x01):
-    """搭起 镜像 -> 覆盖层 -> 终端 -> 内核 -> monitor 这条链."""
+                 escape: int = 0x01):
+    """搭起 镜像 -> 覆盖层 -> 终端 -> 内核 -> monitor 这条链.
+
+    不需要在覆盖层里预置任何文件: 内核 init() 打开的是镜像里真实存在的
+    /dev/tty0(早先为 /bin/init 那条错误引导路径合成过 /dev/console 与
+    /etc/utmp, 已随之删除)。
+    """
     fs = OverlayFS(MinixFS.open(image, offset=offset))
     if scripted_input is None:
         term = ktty.HostTerminal()
     else:
         term = ktty.ScriptedTerminal(inputs=scripted_input)
-    k = Kernel(fs, verbose=verbose)
+    k = Kernel(fs)
     # 转义键回调要指到内核, 所以 TTY 在 Kernel 之后建, 再回填
     tty = ktty.TTY(term, escape=escape, on_escape=k.on_escape)
     k.terminal = tty
     k.monitor = kmonitor.Monitor(k)
-    _preset_overlay(k)
     return k, term
-
-
-def _preset_overlay(k: Kernel) -> None:
-    """在覆盖层里补上镜像缺失的东西(纯内存, 不改镜像).
-
-    镜像里没有 /dev/console, 但 /bin/init 等要打开它; /etc/utmp 与
-    /etc/wtmp 也不存在而 login 要写。
-    """
-    fs = k.fs
-    for path, mode, dev in (("/dev/console", 0o020600, (5 << 8) | 0),):
-        try:
-            fs.walk(path)
-        except FsError:
-            try:
-                fs.mknod(path, mode, dev)
-            except FsError:
-                pass
-    for path in ("/etc/utmp", "/etc/wtmp"):
-        try:
-            fs.walk(path)
-        except FsError:
-            try:
-                fs.create(path, 0o644)
-            except FsError:
-                pass
 
 
 # 需要跟一个值的仿真器选项(拆分参数时要把值一起带走)
@@ -136,8 +115,7 @@ def main(argv=None) -> int:
         return 2
 
     try:
-        k, term = build_kernel(a.image, a.offset, verbose=a.trace,
-                               escape=escape)
+        k, term = build_kernel(a.image, a.offset, escape=escape)
         if a.trace:
             k.set_trace_capacity(kmod.TRACE_VERBOSE)
     except (OSError, MinixError) as e:

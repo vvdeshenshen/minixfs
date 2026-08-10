@@ -341,6 +341,11 @@ class TestProcessSyscalls(SyscallTestCase):
     def test_mount_denied(self):
         self.assertEqual(self.call(ksyscall.NR_MOUNT), -kvfs.EPERM)
 
+    def test_ulimit_returns_enosys(self):
+        """0.11 里 ulimit 就是个 stub。这条以前没测, 掩盖了 kernel.py 漏导入
+        ENOSYS 的 bug —— 真被调到会抛 NameError 而不是返回 -ENOSYS。"""
+        self.assertEqual(self.call(ksyscall.NR_ULIMIT, 3, 0, 0), -kvfs.ENOSYS)
+
 
 # ---------------------------------------------------------------------------
 # 系统调用: 文件
@@ -1284,6 +1289,22 @@ class TestBuiltinInit(unittest.TestCase):
         k.boot_init()
         k._init_step()
         self.assertEqual(k._init_state, "shell")  # 没有 rc 就直接起 shell
+
+    def test_init_needs_no_preset_files(self):
+        """内核 init() 开的是镜像里真实存在的 /dev/tty0, 不依赖任何预置文件。
+
+        早先为磁盘上那个错误的 /bin/init 合成过 /dev/console、/etc/utmp、
+        /etc/wtmp, 现已删除 —— 这里确认删掉后引导仍能起 rc 子进程。
+        """
+        k, term, fs = self.setup_world(rc=b"# rc\n", tty=False)
+        for path in ("/dev/console", "/etc/utmp", "/etc/wtmp"):
+            with self.assertRaises(kvfs.FsError):
+                fs.walk(path)               # 确认没有被预置
+        k.boot_init()
+        k._init_step()                      # rc 阶段应正常 fork 出 sh
+        child = k.procs[k._init_child]
+        self.assertEqual(child.name, "/bin/sh")
+        self.assertEqual(child.fds[0].obj.ino, fs.walk("/etc/rc").ino)
 
     def test_console_alive_on_tty_always_true(self):
         k, term, fs = self.setup_world(tty=True)
