@@ -118,6 +118,11 @@ cpu86.py → x86mem.py                              CPU 层不 import minixfs �
 - 镜像自身的坑: 无 `/dev/console`、无 `/etc/inittab`、`/dev/null` 被误建为块设备
   (故设备分派不检查 b/c 类型)、`/etc/mtab` 的 mtime 超出有符号 i32(故 stat 按无符号
   打包, 与内核 `cp_stat` 逐字段拷 32 位一致)。
+- `/etc/magic` 是 CRLF(DOS)行尾, 有 3 个只含 `\r` 的空行(第 50/115/295)。老 file
+  用 `fgets` 按 `\n` 切行, `\r` 留在行尾, 于是这 3 行被 strtok 切出空 type, 仿真器里
+  跑 `file` 会报 3 条 `type  invalid`(type 为空故两个空格)。这是镜像的 CRLF 瑕疵 +
+  老 file 对空白行不健壮, **真机同样报错, 符合预期**; 我们的 read 逐字节透传 `\r`
+  才是对的, 不要擅自把 CRLF 转成 LF。
 
 ## 领域细节(改代码前必读)
 
