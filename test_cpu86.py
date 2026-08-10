@@ -1456,5 +1456,96 @@ class TestRealLibcCode(unittest.TestCase):
         self.assertEqual(cpu.mem.read_u32(0x9000), 0xCAFE)
 
 
+# ---------------------------------------------------------------------------
+# 性能剖析器
+# ---------------------------------------------------------------------------
+
+class TestProfiler(unittest.TestCase):
+    def _run_prof(self, *chunks, regs=None, src=None):
+        cpu = build_cpu(*chunks, HLT, regs=regs)
+        if src:
+            cpu.mem.write(0x1000, src)
+        cpu.prof = cpu86.Profiler()
+        cpu.run(500)
+        return cpu
+
+    def test_off_by_default(self):
+        cpu = run_code(mov_ri(EAX, 1))
+        self.assertIsNone(cpu.prof)
+
+    def test_category_counts(self):
+        cpu = self._run_prof(
+            mov_ri(ESI, 0x1000), mov_ri(EDI, 0x1200), mov_ri(ECX, 4),  # 3×MOV
+            rep(movsb()),                                              # 1×STRING
+            push_i8(7),                                                # 1×STACK
+            inc_r(EAX),                                                # 1×ALU
+            jmp_rel8(0),                                               # 1×BRANCH
+            src=bytes(range(4)),
+        )
+        c = cpu.prof.cat_counts
+        self.assertEqual(c[cpu86.CAT_MOV], 3)
+        self.assertEqual(c[cpu86.CAT_STRING], 1)
+        self.assertEqual(c[cpu86.CAT_STACK], 1)
+        self.assertEqual(c[cpu86.CAT_ALU], 1)
+        self.assertEqual(c[cpu86.CAT_BRANCH], 1)
+        self.assertEqual(c[cpu86.CAT_OTHER], 1)          # 末尾自动追加的 hlt
+        self.assertEqual(sum(c), cpu.prof.insns)
+        self.assertEqual(cpu.prof.insns, cpu.icount)
+
+    def test_rep_elems_counts_elements_not_instructions(self):
+        """单条 rep movsb 只算一条指令, 却应记 64 个元素."""
+        cpu = self._run_prof(
+            mov_ri(ESI, 0x1000), mov_ri(EDI, 0x1200), mov_ri(ECX, 64),
+            rep(movsb()),
+            src=bytes((i * 3) & 0xFF for i in range(64)),
+        )
+        self.assertEqual(cpu.prof.cat_counts[cpu86.CAT_STRING], 1)
+        self.assertEqual(cpu.prof.rep_elems, 64)
+
+    def test_non_rep_string_counts_one_element(self):
+        cpu = self._run_prof(movsb(), src=b"XY",
+                             regs={"esi": 0x1000, "edi": 0x1200})
+        self.assertEqual(cpu.prof.rep_elems, 1)
+
+    def test_two_byte_opcode_categorized(self):
+        """0F AF imul 应归乘除, 0F B6 movzx 应归 MOV."""
+        cpu = self._run_prof(
+            mov_ri(EAX, 5), mov_ri(EBX, 6),
+            bytes([0x0F, 0xAF]) + rr(EAX, EBX),          # imul eax, ebx
+            movzx8(ECX, EAX),                            # 0F B6
+        )
+        self.assertEqual(cpu.prof.cat_counts[cpu86.CAT_MULDIV], 1)
+        # movzx + 两个 mov imm = 3 条 MOV
+        self.assertEqual(cpu.prof.cat_counts[cpu86.CAT_MOV], 3)
+
+    def test_hotspots_bucket_eip(self):
+        cpu = self._run_prof(mov_ri(EAX, 1), inc_r(EAX))
+        self.assertTrue(cpu.prof.hot)
+        self.assertEqual(sum(cpu.prof.hot.values()), cpu.prof.insns)
+
+    def test_profiling_does_not_change_execution(self):
+        """开与不开剖析, 寄存器/eip/icount/flags 必须逐一相同."""
+        prog = (mov_ri(EAX, 10), mov_ri(ECX, 3), inc_r(EAX),
+                dec_r(ECX), jmp_rel8(0))
+        plain = build_cpu(*prog, HLT)
+        plain.run(500)
+        prof = build_cpu(*prog, HLT)
+        prof.prof = cpu86.Profiler()
+        prof.run(500)
+        self.assertEqual(plain.regs, prof.regs)
+        self.assertEqual(plain.eip, prof.eip)
+        self.assertEqual(plain.icount, prof.icount)
+        self.assertEqual(plain.flags, prof.flags)
+
+    def test_reset_clears(self):
+        cpu = self._run_prof(mov_ri(EAX, 1))
+        self.assertTrue(cpu.prof.insns)
+        cpu.prof.reset()
+        self.assertEqual(cpu.prof.insns, 0)
+        self.assertEqual(cpu.prof.rep_elems, 0)
+        self.assertEqual(sum(cpu.prof.cat_counts), 0)
+        self.assertEqual(cpu.prof.hot, {})
+
+
 if __name__ == "__main__":
     unittest.main()
