@@ -6,6 +6,7 @@ monitor 的读写全部可注入, 所以用脚本化命令驱动、捕获输出�
 
 import unittest
 
+import cpu86
 import kernel as kmod
 import kmonitor
 import ktty
@@ -627,6 +628,65 @@ class TestArgvSplit(unittest.TestCase):
     def test_bare_dash_is_a_positional(self):
         head, tail = self.split("img", "-")
         self.assertEqual(tail, ["-"])
+
+
+class TestProfile(unittest.TestCase):
+    def setUp(self):
+        self.k, self.term, self.fs = make_monitored()
+        self.p = make_proc(self.k, self.fs)
+        self.p.name = "/bin/testprog"
+
+    def test_info_profile_off_by_default(self):
+        out = run_monitor(self.k, ["info profile"])
+        self.assertIn("未开启", out)
+
+    def test_prof_on_off_toggles(self):
+        out = run_monitor(self.k, ["prof on"])
+        self.assertIn("已开启", out)
+        self.assertTrue(self.k.profiling)
+        out = run_monitor(self.k, ["prof off"])
+        self.assertIn("已关闭", out)
+        self.assertFalse(self.k.profiling)
+
+    def test_prof_reset(self):
+        run_monitor(self.k, ["prof on"])
+        self.k._profiler.insns = 5
+        out = run_monitor(self.k, ["prof reset"])
+        self.assertIn("清零", out)
+        self.assertEqual(self.k._profiler.insns, 0)
+
+    def test_prof_reset_without_enable(self):
+        self.assertIn("未开启", run_monitor(self.k, ["prof reset"]))
+
+    def test_prof_unknown_subcommand_shows_usage(self):
+        self.assertIn("用法", run_monitor(self.k, ["prof bogus"]))
+
+    def test_info_profile_renders_mix_and_derived(self):
+        self.k.set_profiling(True)
+        prof = self.k._profiler
+        prof.insns = 100
+        prof.cat_counts[cpu86.CAT_MOV] = 40
+        prof.cat_counts[cpu86.CAT_ALU] = 30
+        prof.cat_counts[cpu86.CAT_BRANCH] = 20
+        prof.cat_counts[cpu86.CAT_STRING] = 10
+        prof.rep_elems = 500
+        prof.hot = {0x1000 >> prof.bucket_shift: 60,
+                    0x2000 >> prof.bucket_shift: 40}
+        out = run_monitor(self.k, ["info profile"])
+        self.assertIn("已剖析 100 条指令", out)
+        self.assertIn("MOV", out)
+        self.assertIn("40.0%", out)              # MOV 占比
+        self.assertIn("分支", out)
+        # 派生指标: 访存(MOV+栈+串)=50%, 控制流 20%, 块长 5.0, rep 放大 50.0
+        self.assertIn("访存指令占比  50.0%", out)
+        self.assertIn("控制流密度    20.0%", out)
+        self.assertIn("平均基本块长  5.0", out)
+        self.assertIn("rep 放大倍数  50.0", out)
+
+    def test_info_cpu_shows_profiling_state(self):
+        self.assertIn("性能剖析: 关", run_monitor(self.k, ["info cpu"]))
+        self.k.set_profiling(True)
+        self.assertIn("性能剖析: 开", run_monitor(self.k, ["info cpu"]))
 
 
 if __name__ == "__main__":

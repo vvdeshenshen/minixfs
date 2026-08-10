@@ -7,8 +7,8 @@
     Ctrl-A ?    显示按键帮助
 
 monitor 里的命令(输入 help 查看):
-    info procs / mem / fs / syscalls / cpu / fds / tty
-    ps  regs  kill  trace  cont  quit
+    info procs / mem / fs / syscalls / cpu / fds / tty / profile
+    ps  regs  kill  trace  prof  cont  quit
 
 读写全部可注入(read_line/write), 所以能用脚本化输入做单元测试, 不必真的
 占用宿主终端 —— 与 pager.py 的注入哲学一致。
@@ -19,6 +19,7 @@ from __future__ import annotations
 import unicodedata
 from typing import Callable, List, Optional
 
+import cpu86
 import kernel as kmod
 import kvfs
 
@@ -51,12 +52,15 @@ info trace [n]    翻看轨迹缓冲里最近 n 条调用(默认 30)
 info cpu [pid]    寄存器与标志位
 info fds [pid]    文件描述符表
 info tty          终端与行规程状态
+info profile      CPU 性能剖析: 指令混合/热点/派生指标(需先 prof on)
 ps                = info procs
 regs [pid]        = info cpu
 kill <pid> [信号] 给被仿真进程发信号(默认 15/SIGTERM)
 trace show [n]    同 info trace
 trace on [容量]   放大轨迹缓冲以留更长历史(默认 5000 条)
 trace off         缩回默认容量(轨迹始终在记, 只是历史更短)
+prof on|off       开关 CPU 性能剖析(默认关; 开着会拖慢仿真)
+prof reset        清零剖析计数
 cont              退出 monitor, 继续仿真
 quit              停止仿真并退出
 help              这份帮助
@@ -188,6 +192,9 @@ class Monitor:
         if cmd == "trace":
             self.cmd_trace(args)
             return False
+        if cmd == "prof":
+            self.cmd_prof(args)
+            return False
         self.out(f"未知命令: {cmd}(输入 help 看命令)")
         return False
 
@@ -195,7 +202,7 @@ class Monitor:
 
     def cmd_info(self, args: List[str]) -> None:
         if not args:
-            self.out("用法: info procs|mem|fs|syscalls|trace|cpu|fds|tty")
+            self.out("用法: info procs|mem|fs|syscalls|trace|cpu|fds|tty|profile")
             return
         what = args[0].lower()
         rest = args[1:]
@@ -212,6 +219,8 @@ class Monitor:
             "fds": lambda: self.info_fds(rest),
             "fd": lambda: self.info_fds(rest),
             "tty": lambda: self.info_tty(),
+            "profile": lambda: self.info_profile(),
+            "prof": lambda: self.info_profile(),
             "trace": lambda: self.show_trace(
                 int(rest[0]) if rest and rest[0].lstrip("-").isdigit() else 30),
         }
@@ -398,6 +407,8 @@ class Monitor:
             self.out(f"  eip 处字节: {p.mem.read(cpu.eip, 8).hex(' ')}")
         except Exception:
             self.out("  eip 处字节: <读不到>")
+        state = "开(info profile 看统计)" if self.k.profiling else "关(prof on 打开)"
+        self.out(f"  性能剖析: {state}")
 
     # ---- 文件描述符 ---------------------------------------------------
 
@@ -511,3 +522,80 @@ class Monitor:
                      f"(仍在记录, 只是历史更短)")
             return
         self.out(f"未知的 trace 子命令: {sub}")
+
+    # ---- 性能剖析 -----------------------------------------------------
+
+    def cmd_prof(self, args: List[str]) -> None:
+        """prof on | off | reset —— 开关 CPU 性能剖析并清零计数.
+
+        剖析默认关: cpu86 是纯 Python 解释器, 逐指令插桩有成本, 开着会拖慢
+        仿真, 所以要显式打开。开启后新建进程的 CPU 也自动挂上同一个剖析器。
+        """
+        k = self.k
+        sub = args[0].lower() if args else "show"
+        if sub == "on":
+            k.set_profiling(True)
+            self.out("CPU 性能剖析已开启(会拖慢仿真; info profile 看统计)。")
+            return
+        if sub == "off":
+            k.set_profiling(False)
+            self.out("CPU 性能剖析已关闭。")
+            return
+        if sub == "reset":
+            if not k.profiling:
+                self.out("剖析未开启(prof on 先打开)。")
+                return
+            k.reset_profiling()
+            self.out("剖析计数已清零。")
+            return
+        self.out(f"用法: prof on|off|reset(当前"
+                 f"{'开' if k.profiling else '关'})")
+
+    def info_profile(self) -> None:
+        k = self.k
+        if not k.profiling or k._profiler is None:
+            self.out("CPU 性能剖析未开启。先在 monitor 里 `prof on`, "
+                     "或启动时加 --profile。")
+            return
+        prof = k._profiler
+        total = prof.insns
+        if total == 0:
+            self.out("剖析已开启, 但还没采到指令(让程序先跑一会儿)。")
+            return
+        self.out(f"已剖析 {total:,} 条指令。")
+
+        # 指令混合: 按计数降序
+        self.out("指令混合(按类别):")
+        order = sorted(range(len(cpu86.CAT_NAMES)),
+                       key=lambda i: -prof.cat_counts[i])
+        rows = [(cpu86.CAT_NAMES[i], f"{prof.cat_counts[i]:,}",
+                 f"{prof.cat_counts[i] * 100 / total:.1f}%")
+                for i in order if prof.cat_counts[i]]
+        for line in table(("类别", "计数", "占比"), rows, aligns=["l", "r", "r"]):
+            self.out("  " + line)
+
+        # eip 热点: top 12 桶
+        span = 1 << prof.bucket_shift
+        top = sorted(prof.hot.items(), key=lambda kv: -kv[1])[:12]
+        self.out(f"热点地址(每桶 {span}B, 前 {len(top)} 名):")
+        hrows = [(f"{b * span:#010x}-{b * span + span - 1:#06x}",
+                  f"{n:,}", f"{n * 100 / total:.1f}%") for b, n in top]
+        for line in table(("地址区间", "计数", "占比"), hrows,
+                          aligns=["l", "r", "r"]):
+            self.out("  " + line)
+
+        # 派生指标
+        c = prof.cat_counts
+        mem_insns = sum(c[i] for i in cpu86._CAT_MEMORY)
+        branches = c[cpu86.CAT_BRANCH]
+        strings = c[cpu86.CAT_STRING]
+        self.out("派生指标:")
+        self.out(f"  访存指令占比  {mem_insns * 100 / total:.1f}%"
+                 f"(MOV+栈+串)")
+        self.out(f"  控制流密度    {branches * 100 / total:.1f}%"
+                 f"(分支指令 / 全部)")
+        avg_bb = total / branches if branches else float(total)
+        self.out(f"  平均基本块长  {avg_bb:.1f} 条 / 分支")
+        if strings:
+            self.out(f"  rep 放大倍数  {prof.rep_elems / strings:.1f}"
+                     f"(串搬 {prof.rep_elems:,} 元素 / {strings:,} 条串指令)")

@@ -96,6 +96,8 @@ def main(argv=None) -> int:
                     help="指令数上限(防跑飞)")
     ap.add_argument("--trace", action="store_true",
                     help="放大轨迹缓冲, 并在退出时把它转储到 stderr")
+    ap.add_argument("--profile", action="store_true",
+                    help="开启 CPU 性能剖析(会拖慢仿真), 退出时把统计转储到 stderr")
     ap.add_argument("--save-overlay", metavar="FILE",
                     help="退出时把覆盖层改动导出到文件")
     ap.add_argument("--load-overlay", metavar="FILE",
@@ -118,6 +120,8 @@ def main(argv=None) -> int:
         k, term = build_kernel(a.image, a.offset, escape=escape)
         if a.trace:
             k.set_trace_capacity(kmod.TRACE_VERBOSE)
+        if a.profile:
+            k.set_profiling(True)      # 须在 boot 前, 好让新建 CPU 都挂上剖析器
     except (OSError, MinixError) as e:
         print(f"打开镜像失败: {e}", file=sys.stderr)
         return 1
@@ -156,6 +160,10 @@ def main(argv=None) -> int:
             # 转储与 monitor 的 `trace show` 同一份数据(带 pid 与 errno 名)
             dump = kmonitor.Monitor(k, write=lambda s: sys.stderr.write(s))
             dump.show_trace(k.trace_capacity)
+        if a.profile:
+            # 与 monitor 的 `info profile` 同一份统计
+            dump = kmonitor.Monitor(k, write=lambda s: sys.stderr.write(s))
+            dump.info_profile()
 
     if a.save_overlay:
         with open(a.save_overlay, "wb") as f:
