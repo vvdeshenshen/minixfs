@@ -139,8 +139,64 @@ class ScriptedTerminal:
         return self.out.decode("latin-1")
 
 
+IS_WINDOWS = os.name == "nt"
+
+# Windows 控制台特殊键的两字节序列: getch 先给 0x00 或 0xE0, 再给扫描码。
+# 翻译成 Unix 终端会发的 ANSI 序列, 这样 bash/readline 才认得。
+_WIN_SCANCODE_TO_ANSI = {
+    b"H": b"\x1b[A",    # ↑
+    b"P": b"\x1b[B",    # ↓
+    b"M": b"\x1b[C",    # →
+    b"K": b"\x1b[D",    # ←
+    b"G": b"\x1b[H",    # Home
+    b"O": b"\x1b[F",    # End
+    b"R": b"\x1b[2~",   # Insert
+    b"S": b"\x1b[3~",   # Delete
+    b"I": b"\x1b[5~",   # PgUp
+    b"Q": b"\x1b[6~",   # PgDn
+}
+
+
+def translate_windows_key(ch: bytes, scancode: bytes = b"") -> bytes:
+    """把 Windows 控制台的一次按键翻译成 Unix 终端等价字节.
+
+    - 回车: Windows 给 CR(0x0D), 与 Unix 终端一致(随后由 ICRNL 转成 LF)
+    - 退格: Windows 给 BS(0x08), 而 Unix 终端发 DEL(0x7F) —— 必须翻译,
+      否则行规程的 VERASE(默认 127)认不出来, 退格键失效
+    - 特殊键: 0x00/0xE0 前缀 + 扫描码, 翻成 ANSI 转义序列
+    - 其余原样透传(含 ^C=0x03 等控制字符, 交给行规程的 ISIG 处理)
+    """
+    if ch in (b"\x00", b"\xe0"):
+        return _WIN_SCANCODE_TO_ANSI.get(scancode, b"")
+    if ch == b"\x08":
+        return b"\x7f"
+    return ch
+
+
+def _enable_windows_ansi(stdout) -> None:
+    """给 Windows 控制台打开 VT 处理, 否则 bash/less 发的转义序列会显示成乱码."""
+    try:
+        import ctypes
+
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.GetStdHandle(-11)          # STD_OUTPUT_HANDLE
+        mode = ctypes.c_uint32()
+        if kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
+            # ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x0004
+            kernel32.SetConsoleMode(handle, mode.value | 0x0004)
+    except Exception:
+        pass
+
+
 class HostTerminal:
-    """宿主终端. 交互时把 stdin 设为 raw, 回显与行编辑由 TTY 行规程负责."""
+    """宿主终端. 交互时按键逐个读入, 回显与行编辑由 TTY 行规程负责.
+
+    输入后端按平台分派:
+      - POSIX 交互/管道: stdin 设 raw + select 轮询
+      - Windows 交互: msvcrt.kbhit/getch(select 在 Windows 上只能用于 socket,
+        对控制台句柄会直接失败, 这正是之前 Windows 下敲键没有回显的原因)
+      - Windows 管道: 后台线程读进队列(同样因为 select 用不了)
+    """
 
     def __init__(self, stdin=None, stdout=None):
         self.stdin = stdin or sys.stdin
@@ -152,9 +208,22 @@ class HostTerminal:
             self._fd = self.stdin.fileno()
         except (AttributeError, OSError):
             self._fd = None
-        self._is_tty = bool(self._fd is not None and self.stdin.isatty())
-        if self._is_tty:
+        try:
+            self._is_tty = bool(self._fd is not None and self.stdin.isatty())
+        except (AttributeError, ValueError):
+            self._is_tty = False
+        self._thread_buf = bytearray()
+        self._thread = None
+        self._lock = None
+        if IS_WINDOWS:
+            if self._is_tty:
+                _enable_windows_ansi(self.stdout)
+            else:
+                self._start_reader_thread()
+        elif self._is_tty:
             self._enter_raw()
+
+    # ---- POSIX raw 模式 -----------------------------------------------
 
     def _enter_raw(self) -> None:
         try:
@@ -172,6 +241,40 @@ class HostTerminal:
             termios.tcsetattr(self._fd, termios.TCSADRAIN, self._saved)
             self._raw = False
 
+    # ---- Windows 管道: 后台读取线程 -------------------------------------
+
+    def _start_reader_thread(self) -> None:
+        import threading
+
+        self._lock = threading.Lock()
+        stream = getattr(self.stdin, "buffer", self.stdin)
+
+        def reader():
+            while True:
+                try:
+                    chunk = stream.read(1)
+                except Exception:
+                    chunk = b""
+                if not chunk:
+                    with self._lock:
+                        self._eof = True
+                    return
+                if isinstance(chunk, str):
+                    chunk = chunk.encode("latin-1")
+                with self._lock:
+                    self._thread_buf.extend(chunk)
+
+        self._thread = threading.Thread(target=reader, daemon=True)
+        self._thread.start()
+
+    def _drain_thread_buf(self) -> bytes:
+        with self._lock:
+            data = bytes(self._thread_buf)
+            self._thread_buf.clear()
+        return data
+
+    # ---- 统一读接口 ---------------------------------------------------
+
     def poll_input(self) -> bytes:
         return self._read(0)
 
@@ -179,6 +282,12 @@ class HostTerminal:
         return self._read(timeout)
 
     def _read(self, timeout: float) -> bytes:
+        if IS_WINDOWS:
+            return (self._read_windows_console(timeout) if self._is_tty
+                    else self._read_thread(timeout))
+        return self._read_posix(timeout)
+
+    def _read_posix(self, timeout: float) -> bytes:
         if self._fd is None or self._eof:
             return b""
         try:
@@ -195,8 +304,44 @@ class HostTerminal:
             self._eof = True
         return data
 
+    def _read_windows_console(self, timeout: float) -> bytes:
+        """用 msvcrt 逐键读控制台. getch 不回显, 正好交给行规程做回显."""
+        import msvcrt
+        import time as _time
+
+        deadline = _time.monotonic() + max(timeout, 0.0)
+        out = bytearray()
+        while True:
+            while msvcrt.kbhit():
+                ch = msvcrt.getch()
+                scancode = msvcrt.getch() if ch in (b"\x00", b"\xe0") else b""
+                out += translate_windows_key(ch, scancode)
+            if out or timeout <= 0:
+                return bytes(out)
+            if _time.monotonic() >= deadline:
+                return b""
+            _time.sleep(0.005)
+
+    def _read_thread(self, timeout: float) -> bytes:
+        import time as _time
+
+        deadline = _time.monotonic() + max(timeout, 0.0)
+        while True:
+            data = self._drain_thread_buf()
+            if data or timeout <= 0:
+                return data
+            if self._eof or _time.monotonic() >= deadline:
+                return b""
+            _time.sleep(0.005)
+
     @property
     def at_eof(self) -> bool:
+        """交互控制台永不 EOF(真机上控制台也不会), 只有管道/文件才会读完."""
+        if self._is_tty:
+            return False
+        if self._lock is not None:
+            with self._lock:
+                return self._eof and not self._thread_buf
         return self._eof
 
     def write_out(self, data: bytes) -> None:

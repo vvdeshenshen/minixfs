@@ -73,6 +73,12 @@ cpu86.py → x86mem.py                              CPU 层不 import minixfs �
   读 /etc/profile)并汇报子进程死亡。已实现为 `Kernel.boot_init()` + `_init_step()`
   状态机(内核任务, `kernel_task=True`, 不占用户态 CPU)。镜像里的 `/bin/init` 是
   后来某软件包的产物, **不在引导链上**, 别再拿它当入口。
+- **终端 I/O 必须分平台**: `select` 在 Windows 上只对 socket 有效, 拿控制台句柄调
+  会直接失败 —— 早期版本因此在 Windows 下敲键完全没反应。现在 `HostTerminal`
+  分三条路: POSIX 用 raw+select, Windows 交互用 `msvcrt.kbhit/getch`,
+  Windows 管道用后台线程。Windows 的退格是 BS(0x08) 而非 DEL(0x7F), 必须经
+  `translate_windows_key()` 翻译, 否则行规程的 VERASE 认不出来。输出一律写
+  `stdout.buffer`(二进制), 否则 Windows 文本层会把 \n 再变 \r\n 与 ONLCR 撞车。
 - **ABI 一律从镜像内部查证, 不要凭记忆**: 镜像带着 `/usr/src/linux` 的内核 C 源码
   (`fs/` 18 个 .c, `kernel/` 10 个 .c)与完整 `/usr/include`。查法:
   `fs.read_file(fs.resolve('/usr/src/linux/fs/exec.c'))`。已据此确认: 初始栈布局

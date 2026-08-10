@@ -280,5 +280,147 @@ class TestPump(unittest.TestCase):
         self.assertEqual(bytes(t.ready), b"y\n")
 
 
+class TestWindowsKeyTranslation(unittest.TestCase):
+    """Windows 控制台按键翻译 —— 纯函数, 在任何平台上都能测."""
+
+    def test_backspace_becomes_del(self):
+        """Windows 给 BS(0x08), Unix 终端发 DEL(0x7F)。不翻译的话行规程的
+        VERASE(默认 127)认不出来, 退格键就失效。"""
+        self.assertEqual(ktty.translate_windows_key(b"\x08"), b"\x7f")
+
+    def test_backspace_actually_erases_after_translation(self):
+        """端到端: 翻译后的字节喂进行规程, 退格必须真的删掉字符."""
+        t, term, _ = make_tty()
+        t.feed(b"ab")
+        t.feed(ktty.translate_windows_key(b"\x08"))
+        t.feed(b"c\n")
+        self.assertEqual(t.read(100), b"ac\n")
+
+    def test_carriage_return_passes_through(self):
+        """Windows 回车给 CR, 与 Unix 终端一致, 随后由 ICRNL 转 LF."""
+        self.assertEqual(ktty.translate_windows_key(b"\r"), b"\r")
+        t, term, _ = make_tty()
+        t.feed(ktty.translate_windows_key(b"\r"))
+        self.assertEqual(t.read(10), b"\n")
+
+    def test_ordinary_chars_pass_through(self):
+        for ch in (b"a", b"Z", b"0", b" ", b"~"):
+            self.assertEqual(ktty.translate_windows_key(ch), ch)
+
+    def test_control_chars_pass_through_for_isig(self):
+        """^C/^D/^U 要原样透传, 交给行规程的 ISIG 与行编辑处理."""
+        for ch in (b"\x03", b"\x04", b"\x15", b"\x1a"):
+            self.assertEqual(ktty.translate_windows_key(ch), ch)
+
+    def test_ctrl_c_still_raises_sigint_on_windows_path(self):
+        t, term, got = make_tty()
+        t.feed(ktty.translate_windows_key(b"\x03"))
+        t.read(10)
+        self.assertEqual(got, [(7, ktty.SIGINT)])
+
+    def test_arrow_keys_become_ansi_sequences(self):
+        """特殊键是 0x00/0xE0 前缀 + 扫描码, 要翻成 ANSI 序列 bash 才认得."""
+        cases = {b"H": b"\x1b[A", b"P": b"\x1b[B",
+                 b"M": b"\x1b[C", b"K": b"\x1b[D"}
+        for scan, want in cases.items():
+            self.assertEqual(ktty.translate_windows_key(b"\xe0", scan), want)
+            self.assertEqual(ktty.translate_windows_key(b"\x00", scan), want)
+
+    def test_home_end_delete_pgup_pgdn(self):
+        self.assertEqual(ktty.translate_windows_key(b"\xe0", b"G"), b"\x1b[H")
+        self.assertEqual(ktty.translate_windows_key(b"\xe0", b"O"), b"\x1b[F")
+        self.assertEqual(ktty.translate_windows_key(b"\xe0", b"S"), b"\x1b[3~")
+        self.assertEqual(ktty.translate_windows_key(b"\xe0", b"I"), b"\x1b[5~")
+        self.assertEqual(ktty.translate_windows_key(b"\xe0", b"Q"), b"\x1b[6~")
+
+    def test_unknown_scancode_is_dropped(self):
+        """未识别的功能键(F1 等)丢掉, 不能把扫描码当数据塞给 shell."""
+        self.assertEqual(ktty.translate_windows_key(b"\x00", b"\x3b"), b"")
+        self.assertEqual(ktty.translate_windows_key(b"\xe0", b"?"), b"")
+
+
+class TestHostTerminalPlatformDispatch(unittest.TestCase):
+    """HostTerminal 的平台分派与 EOF 语义(不真的碰宿主 tty)."""
+
+    class FakeStdin:
+        """假 stdin: 可控制 isatty 与 fileno."""
+
+        def __init__(self, tty=False, data=b""):
+            self._tty = tty
+            import io
+            self.buffer = io.BytesIO(data)
+
+        def isatty(self):
+            return self._tty
+
+        def fileno(self):
+            raise OSError("没有真实 fd")
+
+    class FakeStdout:
+        def __init__(self):
+            import io
+            self.buffer = io.BytesIO()
+
+    def test_non_tty_stdin_reports_not_a_tty(self):
+        h = ktty.HostTerminal(self.FakeStdin(tty=False), self.FakeStdout())
+        self.assertFalse(h.is_tty())
+
+    def test_interactive_console_never_reports_eof(self):
+        """真机控制台不会 EOF —— init 的 respawn 循环依赖这个判断."""
+        h = ktty.HostTerminal(self.FakeStdin(tty=True), self.FakeStdout())
+        h._is_tty = True
+        h._eof = True
+        self.assertFalse(h.at_eof)
+
+    def test_write_out_uses_binary_buffer(self):
+        """必须写 buffer(二进制), 否则 Windows 的文本层会把 \\n 再变成 \\r\\n,
+        与我们 ONLCR 已经加的 CR 撞成双份."""
+        out = self.FakeStdout()
+        h = ktty.HostTerminal(self.FakeStdin(), out)
+        h.write_out(b"a\r\n")
+        self.assertEqual(out.buffer.getvalue(), b"a\r\n")
+
+    def test_thread_reader_drains_piped_bytes(self):
+        """Windows 管道走后台线程(select 在 Windows 上用不了)."""
+        import time
+        h = ktty.HostTerminal.__new__(ktty.HostTerminal)
+        h.stdin = self.FakeStdin(data=b"hello\n")
+        h.stdout = self.FakeStdout()
+        h._eof = False
+        h._is_tty = False
+        h._thread_buf = bytearray()
+        h._thread = None
+        h._lock = None
+        h._start_reader_thread()
+        got = b""
+        for _ in range(200):
+            got += h._read_thread(0.05)
+            if got.endswith(b"\n"):
+                break
+            time.sleep(0.005)
+        self.assertEqual(got, b"hello\n")
+
+    def test_thread_reader_reports_eof_after_drain(self):
+        import time
+        h = ktty.HostTerminal.__new__(ktty.HostTerminal)
+        h.stdin = self.FakeStdin(data=b"x")
+        h.stdout = self.FakeStdout()
+        h._eof = False
+        h._is_tty = False
+        h._thread_buf = bytearray()
+        h._thread = None
+        h._lock = None
+        h._start_reader_thread()
+        for _ in range(200):
+            if h._read_thread(0.05) == b"x":
+                break
+            time.sleep(0.005)
+        for _ in range(100):
+            if h.at_eof:
+                break
+            time.sleep(0.01)
+        self.assertTrue(h.at_eof)      # 读完且流已关 -> EOF
+
+
 if __name__ == "__main__":
     unittest.main()

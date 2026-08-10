@@ -130,8 +130,12 @@ python3 -m unittest test_minixfs test_cpu86 test_kvfs test_kernel test_ktty
 
 ### 已知限制
 
-- **性能**: 纯 Python 解释, 约 0.4M 条指令/秒。`date` 不到 1 秒, bash 启动数秒。
-  用 `pypy3` 运行可获数量级加速(零代码改动)。
+- **性能**: 纯 Python 解释, 约 0.4M 条指令/秒。`date` 不到 1 秒, bash 启动数秒,
+  完整引导到登录 shell 要一两分钟。用 `pypy3` 运行可获数量级加速(零代码改动)。
+- **平台**: Linux/macOS 与 Windows 都可用。Windows 下终端输入走 `msvcrt`
+  (`select` 在 Windows 上只能用于 socket, 对控制台句柄无效), 管道输入走后台读取
+  线程; 退格键 BS(0x08) 会翻译成 Unix 终端的 DEL(0x7F), 方向键等特殊键翻译成
+  ANSI 转义序列, 并自动打开控制台的 VT 处理。
 - **x87 浮点未实现**: 镜像 libc 是软浮点编译的(`fp.o`/`fp-interf.o`), 且 0.11 内核的
   `math_emulate` 本身就只是个发 SIGFPE 的桩, 故暂不需要。遇到 x87 指令会抛出带
   eip 与机器码字节的 `CpuError`。
