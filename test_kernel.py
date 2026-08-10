@@ -9,6 +9,7 @@ import io
 import struct
 import unittest
 
+import cpu86
 import kernel as kmod
 import kexec
 import ksyscall
@@ -1311,6 +1312,61 @@ class TestBuiltinInit(unittest.TestCase):
         self.assertTrue(k._console_alive())
         k, term, fs = self.setup_world(tty=False)
         self.assertFalse(k._console_alive())
+
+
+# ---------------------------------------------------------------------------
+# CPU 性能剖析开关
+# ---------------------------------------------------------------------------
+
+class TestProfiling(unittest.TestCase):
+    def test_off_by_default(self):
+        k, _, fs = make_kernel()
+        self.assertFalse(k.profiling)
+        self.assertIsNone(k._profiler)
+        self.assertIsNone(k._make_cpu(AddressSpace()).prof)
+
+    def test_set_profiling_attaches_shared_instance(self):
+        k, _, fs = make_kernel()
+        p = make_proc(k, fs)
+        k.set_profiling(True)
+        self.assertTrue(k.profiling)
+        self.assertIsNotNone(k._profiler)
+        # 现存进程与新建 CPU 共用同一个 Profiler 实例(整机聚合)
+        self.assertIs(p.cpu.prof, k._profiler)
+        self.assertIs(k._make_cpu(AddressSpace()).prof, k._profiler)
+
+    def test_set_profiling_off_detaches(self):
+        k, _, fs = make_kernel()
+        p = make_proc(k, fs)
+        k.set_profiling(True)
+        k.set_profiling(False)
+        self.assertFalse(k.profiling)
+        self.assertIsNone(k._profiler)
+        self.assertIsNone(p.cpu.prof)
+
+    def test_reset_profiling(self):
+        k, _, fs = make_kernel()
+        k.set_profiling(True)
+        k._profiler.insns = 5
+        k._profiler.rep_elems = 9
+        k.reset_profiling()
+        self.assertEqual(k._profiler.insns, 0)
+        self.assertEqual(k._profiler.rep_elems, 0)
+
+    def test_end_to_end_collects_stats(self):
+        """开着剖析跑 hello: 应记到 int 0x80(其他类)与若干 MOV。"""
+        k, term, fs = make_kernel()
+        v = fs.create("/prog", 0o755)
+        fs.write(v, 0, make_aout(hello_program(b"hi\n")))
+        k.set_profiling(True)
+        k.boot("/prog", [b"/prog"])
+        k.run(2_000_000)
+        prof = k._profiler
+        self.assertGreater(prof.insns, 0)
+        # hello 用 4 条 mov imm 装参数, 至少有 MOV; int 0x80 归其他类
+        self.assertGreater(prof.cat_counts[cpu86.CAT_MOV], 0)
+        self.assertGreater(prof.cat_counts[cpu86.CAT_OTHER], 0)
+        self.assertTrue(prof.hot)
 
 
 if __name__ == "__main__":

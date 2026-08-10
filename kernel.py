@@ -16,7 +16,7 @@ from collections import Counter, deque
 from typing import Dict, List, Optional
 
 import kvfs
-from cpu86 import CPU, DivideError, MagicJump
+from cpu86 import CPU, DivideError, MagicJump, Profiler
 from kexec import ExecError, load_aout, resolve_exec, setup_stack
 from ksyscall import (SEEK_CUR, SEEK_END, SEEK_SET, UTSNAME_FIELDS, Blocked,
                       SyscallTable, pack_stat)
@@ -153,6 +153,11 @@ class Kernel:
         # 早先还并存一个无上限的 self.trace 列表, 但它不含 pid 且没人读, 已删。
         self.trace_capacity = TRACE_DEFAULT
         self.recent_syscalls = deque(maxlen=TRACE_DEFAULT)
+        # CPU 性能剖析: 默认关(纯 Python 解释器, 逐指令插桩有成本), 由 monitor
+        # 的 `prof on` 或 --profile 打开; 开启后新建的 CPU 也自动挂上剖析器。
+        # 各进程共用一个 Profiler 实例, 得到整机聚合视图。
+        self.profiling = False
+        self._profiler: Optional[Profiler] = None
 
     # ---- 进程创建 -----------------------------------------------------
 
@@ -175,7 +180,7 @@ class Kernel:
         v, argv = resolve_exec(self.fs, path, argv, p.cwd, p.root)
         entry, _ = load_aout(p.mem, self.fs, v)
         esp = setup_stack(p.mem, argv, envp)
-        p.cpu = CPU(p.mem, on_int=self._on_int, on_fault=self._on_fault)
+        p.cpu = self._make_cpu(p.mem)
         p.cpu.eip = entry
         p.cpu.regs[4] = esp                      # ESP
         p.name = path
@@ -232,6 +237,29 @@ class Kernel:
         n = max(int(n), 1)
         self.trace_capacity = n
         self.recent_syscalls = deque(self.recent_syscalls, maxlen=n)
+
+    def _make_cpu(self, mem) -> CPU:
+        """统一的 CPU 工厂: 挂内核回调, 剖析开启时顺带挂上共享剖析器。"""
+        cpu = CPU(mem, on_int=self._on_int, on_fault=self._on_fault)
+        cpu.prof = self._profiler          # 关闭时为 None
+        return cpu
+
+    def set_profiling(self, on: bool) -> None:
+        """开关 CPU 性能剖析, 并给所有现存进程的 CPU 挂/撤共享剖析器。
+
+        各进程共用一个 Profiler 实例, 得到整机聚合视图, `info profile` 直接读它。
+        """
+        on = bool(on)
+        self.profiling = on
+        self._profiler = Profiler() if on else None
+        for p in self.procs.values():
+            if p.cpu is not None:
+                p.cpu.prof = self._profiler
+
+    def reset_profiling(self) -> None:
+        """清零当前剖析计数(不改开关状态)."""
+        if self._profiler is not None:
+            self._profiler.reset()
 
     def _on_fault(self, cpu: CPU, exc: BaseException) -> None:
         kind = "除零" if isinstance(exc, DivideError) else "段错误"
@@ -679,7 +707,7 @@ class Kernel:
         entry, _ = load_aout(mem, self.fs, v)
         esp = setup_stack(mem, argv, envp)
         p.mem = mem
-        p.cpu = CPU(mem, on_int=self._on_int, on_fault=self._on_fault)
+        p.cpu = self._make_cpu(mem)
         p.cpu.eip = entry
         p.cpu.regs[4] = esp
         p.name = name
@@ -717,7 +745,7 @@ class Kernel:
             if f is not None:
                 self._acquire_fd(f)
                 child.fds[i] = f
-        child.cpu = CPU(child.mem, on_int=self._on_int, on_fault=self._on_fault)
+        child.cpu = self._make_cpu(child.mem)
         child.cpu.restore(p.cpu.snapshot())
         child.cpu.regs[0] = 0                 # 子进程 fork 返回 0
         self.procs[child.pid] = child
@@ -957,7 +985,7 @@ class Kernel:
         v, argv = resolve_exec(self.fs, path, argv, child.cwd, child.root)
         entry, _ = load_aout(child.mem, self.fs, v)
         esp = setup_stack(child.mem, argv, envp)
-        child.cpu = CPU(child.mem, on_int=self._on_int, on_fault=self._on_fault)
+        child.cpu = self._make_cpu(child.mem)
         child.cpu.eip = entry
         child.cpu.regs[4] = esp
         if new_session:
