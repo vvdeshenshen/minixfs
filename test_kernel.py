@@ -1321,52 +1321,95 @@ class TestBuiltinInit(unittest.TestCase):
 class TestProfiling(unittest.TestCase):
     def test_off_by_default(self):
         k, _, fs = make_kernel()
-        self.assertFalse(k.profiling)
-        self.assertIsNone(k._profiler)
-        self.assertIsNone(k._make_cpu(AddressSpace()).prof)
-
-    def test_set_profiling_attaches_shared_instance(self):
-        k, _, fs = make_kernel()
         p = make_proc(k, fs)
+        self.assertFalse(k.profiling)
+        self.assertIsNone(k._make_cpu(AddressSpace(), p).prof)
+
+    def test_set_profiling_gives_each_process_its_own(self):
+        k, _, fs = make_kernel()
+        p1 = make_proc(k, fs)
+        p2 = make_proc(k, fs)
         k.set_profiling(True)
         self.assertTrue(k.profiling)
-        self.assertIsNotNone(k._profiler)
-        # 现存进程与新建 CPU 共用同一个 Profiler 实例(整机聚合)
-        self.assertIs(p.cpu.prof, k._profiler)
-        self.assertIs(k._make_cpu(AddressSpace()).prof, k._profiler)
+        # 每进程各一个 Profiler, 不共享(便于按进程/按二进制分析)
+        self.assertIsNotNone(p1.prof)
+        self.assertIs(p1.cpu.prof, p1.prof)
+        self.assertIsNot(p1.prof, p2.prof)
 
-    def test_set_profiling_off_detaches(self):
+    def test_new_cpu_reuses_process_profiler(self):
+        """execve 换 CPU 后应续用同一个进程剖析器, 不新起一份."""
         k, _, fs = make_kernel()
         p = make_proc(k, fs)
         k.set_profiling(True)
+        first = p.prof
+        cpu2 = k._make_cpu(AddressSpace(), p)      # 模拟 execve 再造 CPU
+        self.assertIs(cpu2.prof, first)
+
+    def test_set_profiling_off_keeps_data(self):
+        k, _, fs = make_kernel()
+        p = make_proc(k, fs)
+        k.set_profiling(True)
+        p.prof.insns = 3
         k.set_profiling(False)
         self.assertFalse(k.profiling)
-        self.assertIsNone(k._profiler)
-        self.assertIsNone(p.cpu.prof)
+        self.assertIsNone(p.cpu.prof)             # 停止采集
+        self.assertEqual(p.prof.insns, 3)         # 已采数据保留
 
     def test_reset_profiling(self):
         k, _, fs = make_kernel()
+        p = make_proc(k, fs)
         k.set_profiling(True)
-        k._profiler.insns = 5
-        k._profiler.rep_elems = 9
+        p.prof.insns = 5
+        p.prof.rep_elems = 9
         k.reset_profiling()
-        self.assertEqual(k._profiler.insns, 0)
-        self.assertEqual(k._profiler.rep_elems, 0)
+        self.assertEqual(p.prof.insns, 0)
+        self.assertEqual(p.prof.rep_elems, 0)
 
-    def test_end_to_end_collects_stats(self):
-        """开着剖析跑 hello: 应记到 int 0x80(其他类)与若干 MOV。"""
+    def test_per_process_syscall_counts(self):
+        import ksyscall
+        k, _, fs = make_kernel()
+        p = make_proc(k, fs)
+        k._on_int_stats(p, ksyscall.NR_WRITE, 1, 0x100, 5, 5)
+        k._on_int_stats(p, ksyscall.NR_WRITE, 1, 0x100, 3, 3)
+        self.assertEqual(p.syscall_counts[ksyscall.NR_WRITE], 2)
+        self.assertEqual(p.syscall_total, 2)
+        self.assertEqual(k.syscall_counts[ksyscall.NR_WRITE], 2)   # 全局也记
+
+    def test_reap_captures_history(self):
+        k, _, fs = make_kernel()
+        p = make_proc(k, fs)
+        p.name = "/bin/thing"
+        p.utime = 4242
+        p.wall = 0.5
+        p.exit_code = 7 << 8
+        p.syscall_counts[4] = 3
+        prof = cpu86.Profiler()
+        p.prof = prof
+        pid = p.pid
+        k._reap(p)
+        self.assertNotIn(pid, k.procs)            # 已从进程表移除
+        self.assertEqual(len(k.proc_history), 1)
+        rec = k.proc_history[0]
+        self.assertEqual((rec.pid, rec.name, rec.icount), (pid, "/bin/thing", 4242))
+        self.assertEqual(rec.wall, 0.5)
+        self.assertEqual(rec.syscalls[4], 3)
+        self.assertIs(rec.prof, prof)
+        self.assertEqual(rec.exit_code, 7 << 8)
+
+    def test_end_to_end_per_process_stats(self):
+        """开着剖析跑 hello: 该进程记到指令混合、系统调用与墙钟时间。"""
         k, term, fs = make_kernel()
         v = fs.create("/prog", 0o755)
         fs.write(v, 0, make_aout(hello_program(b"hi\n")))
         k.set_profiling(True)
-        k.boot("/prog", [b"/prog"])
+        p = k.boot("/prog", [b"/prog"])
         k.run(2_000_000)
-        prof = k._profiler
-        self.assertGreater(prof.insns, 0)
-        # hello 用 4 条 mov imm 装参数, 至少有 MOV; int 0x80 归其他类
-        self.assertGreater(prof.cat_counts[cpu86.CAT_MOV], 0)
-        self.assertGreater(prof.cat_counts[cpu86.CAT_OTHER], 0)
-        self.assertTrue(prof.hot)
+        self.assertGreater(p.utime, 0)            # 指令数
+        self.assertGreaterEqual(p.wall, 0.0)      # 墙钟(常开)
+        self.assertGreater(p.syscall_total, 0)    # 至少 write+exit
+        self.assertGreater(p.prof.cat_counts[cpu86.CAT_MOV], 0)
+        self.assertGreater(p.prof.cat_counts[cpu86.CAT_OTHER], 0)   # int 0x80
+        self.assertTrue(p.prof.hot)
 
 
 if __name__ == "__main__":

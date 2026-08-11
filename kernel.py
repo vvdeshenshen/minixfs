@@ -27,6 +27,7 @@ from x86mem import AddressSpace, SegFault
 
 TRACE_DEFAULT = 200       # 轨迹环形缓冲默认容量
 TRACE_VERBOSE = 5000      # trace on / --trace 时的容量
+PERF_HISTORY = 200        # 已死进程性能记录的保留条数
 
 NR_OPEN = 20              # 内核 include/linux/fs.h: 每进程最多 20 个 fd
 HZ = 100
@@ -101,6 +102,14 @@ class Process:
         self.restart_syscall = False
         self.sigframes = []      # 每层信号帧是否含 blocked 字段
         self.kernel_task = False  # True = 内核任务(init), 无用户态 CPU
+        # ---- 性能统计(按进程, 死后进历史) ----
+        self.wall = 0.0                    # 宿主墙钟秒数: 仿真该进程实际耗时
+        self.syscall_counts = Counter()    # 本进程各系统调用次数
+        self.prof = None                   # 本进程指令剖析器(profiling 开时挂上)
+
+    @property
+    def syscall_total(self) -> int:
+        return sum(self.syscall_counts.values())
 
     def alloc_fd(self, start: int = 0) -> int:
         for i in range(start, NR_OPEN):
@@ -112,6 +121,28 @@ class Process:
         if not 0 <= fd < NR_OPEN or self.fds[fd] is None:
             raise FsError(EBADF, f"无效 fd: {fd}")
         return self.fds[fd]
+
+
+class ProcPerf:
+    """已死进程的性能快照: 进程被回收(reap)时从 Process 拷一份留存,
+    好在 monitor 里回看'镜像里哪个二进制跑了多少、什么指令分布'。"""
+
+    __slots__ = ("pid", "ppid", "name", "icount", "wall",
+                 "syscalls", "prof", "exit_code")
+
+    def __init__(self, p: "Process"):
+        self.pid = p.pid
+        self.ppid = p.ppid
+        self.name = p.name
+        self.icount = p.utime               # 累计用户态指令数(跨 execve 累加)
+        self.wall = p.wall
+        self.syscalls = Counter(p.syscall_counts)
+        self.prof = p.prof                  # 指令剖析器(可能为 None)
+        self.exit_code = p.exit_code
+
+    @property
+    def syscall_total(self) -> int:
+        return sum(self.syscalls.values())
 
 
 class Exited(Exception):
@@ -153,11 +184,11 @@ class Kernel:
         # 早先还并存一个无上限的 self.trace 列表, 但它不含 pid 且没人读, 已删。
         self.trace_capacity = TRACE_DEFAULT
         self.recent_syscalls = deque(maxlen=TRACE_DEFAULT)
-        # CPU 性能剖析: 默认关(纯 Python 解释器, 逐指令插桩有成本), 由 monitor
-        # 的 `prof on` 或 --profile 打开; 开启后新建的 CPU 也自动挂上剖析器。
-        # 各进程共用一个 Profiler 实例, 得到整机聚合视图。
+        # CPU 性能剖析: 指令混合默认关(纯 Python 解释器, 逐指令插桩有成本), 由
+        # monitor 的 `prof on` 或 --profile 打开, 每进程各一个 Profiler。而按进程
+        # 的指令数/仿真时间/系统调用统计是常开的(开销可忽略), 死后进 proc_history。
         self.profiling = False
-        self._profiler: Optional[Profiler] = None
+        self.proc_history: deque = deque(maxlen=PERF_HISTORY)
 
     # ---- 进程创建 -----------------------------------------------------
 
@@ -180,7 +211,7 @@ class Kernel:
         v, argv = resolve_exec(self.fs, path, argv, p.cwd, p.root)
         entry, _ = load_aout(p.mem, self.fs, v)
         esp = setup_stack(p.mem, argv, envp)
-        p.cpu = self._make_cpu(p.mem)
+        p.cpu = self._make_cpu(p.mem, p)
         p.cpu.eip = entry
         p.cpu.regs[4] = esp                      # ESP
         p.name = path
@@ -231,6 +262,7 @@ class Kernel:
         """
         self.syscall_counts[nr] += 1
         self.recent_syscalls.append((p.pid, nr, a, b, c, ret))
+        p.syscall_counts[nr] += 1              # 按进程一份, 死后随 ProcPerf 留存
 
     def set_trace_capacity(self, n: int) -> None:
         """调整轨迹环形缓冲容量, 保留已有记录的尾部."""
@@ -238,28 +270,40 @@ class Kernel:
         self.trace_capacity = n
         self.recent_syscalls = deque(self.recent_syscalls, maxlen=n)
 
-    def _make_cpu(self, mem) -> CPU:
-        """统一的 CPU 工厂: 挂内核回调, 剖析开启时顺带挂上共享剖析器。"""
+    def _make_cpu(self, mem, proc: "Process") -> CPU:
+        """统一的 CPU 工厂: 挂内核回调, 剖析开启时给该进程挂上自己的剖析器。
+
+        剖析器挂在 Process 上而非 CPU 上, 这样 execve 换掉 CPU 后仍能续着记
+        (同一个二进制程序), 而 fork 出的子进程是新 Process, 自然是全新的一份。
+        """
         cpu = CPU(mem, on_int=self._on_int, on_fault=self._on_fault)
-        cpu.prof = self._profiler          # 关闭时为 None
+        if self.profiling:
+            if proc.prof is None:
+                proc.prof = Profiler()
+            cpu.prof = proc.prof
         return cpu
 
     def set_profiling(self, on: bool) -> None:
-        """开关 CPU 性能剖析, 并给所有现存进程的 CPU 挂/撤共享剖析器。
+        """开关 CPU 指令混合剖析, 给所有现存进程的 CPU 挂/撤各自的剖析器。
 
-        各进程共用一个 Profiler 实例, 得到整机聚合视图, `info profile` 直接读它。
+        (按进程的指令数/仿真时间/系统调用统计始终常开, 不受此开关影响。)
         """
-        on = bool(on)
-        self.profiling = on
-        self._profiler = Profiler() if on else None
+        self.profiling = bool(on)
         for p in self.procs.values():
-            if p.cpu is not None:
-                p.cpu.prof = self._profiler
+            if p.cpu is None:
+                continue
+            if self.profiling:
+                if p.prof is None:
+                    p.prof = Profiler()
+                p.cpu.prof = p.prof
+            else:
+                p.cpu.prof = None          # 停止采集, 但保留已采到的数据
 
     def reset_profiling(self) -> None:
-        """清零当前剖析计数(不改开关状态)."""
-        if self._profiler is not None:
-            self._profiler.reset()
+        """清零现存进程的指令混合计数(不动历史与常开统计)."""
+        for p in self.procs.values():
+            if p.prof is not None:
+                p.prof.reset()
 
     def _on_fault(self, cpu: CPU, exc: BaseException) -> None:
         kind = "除零" if isinstance(exc, DivideError) else "段错误"
@@ -707,7 +751,7 @@ class Kernel:
         entry, _ = load_aout(mem, self.fs, v)
         esp = setup_stack(mem, argv, envp)
         p.mem = mem
-        p.cpu = self._make_cpu(mem)
+        p.cpu = self._make_cpu(mem, p)
         p.cpu.eip = entry
         p.cpu.regs[4] = esp
         p.name = name
@@ -745,7 +789,7 @@ class Kernel:
             if f is not None:
                 self._acquire_fd(f)
                 child.fds[i] = f
-        child.cpu = self._make_cpu(child.mem)
+        child.cpu = self._make_cpu(child.mem, child)
         child.cpu.restore(p.cpu.snapshot())
         child.cpu.regs[0] = 0                 # 子进程 fork 返回 0
         self.procs[child.pid] = child
@@ -776,11 +820,16 @@ class Kernel:
                     p.mem.write_u32(statp, q.exit_code & 0xFFFFFFFF)
                 p.cutime += q.utime
                 p.cstime += q.stime
-                del self.procs[q.pid]
+                self._reap(q)
                 return q.pid
         if options & 1:                       # WNOHANG
             return 0
         raise Blocked(("wait", p.pid))
+
+    def _reap(self, q: Process) -> None:
+        """回收一个僵尸: 先把它的性能快照存进历史, 再从进程表移除。"""
+        self.proc_history.append(ProcPerf(q))
+        del self.procs[q.pid]
 
     def _exit_process(self, p: Process, code: int) -> None:
         p.state = ZOMBIE
@@ -985,7 +1034,7 @@ class Kernel:
         v, argv = resolve_exec(self.fs, path, argv, child.cwd, child.root)
         entry, _ = load_aout(child.mem, self.fs, v)
         esp = setup_stack(child.mem, argv, envp)
-        child.cpu = self._make_cpu(child.mem)
+        child.cpu = self._make_cpu(child.mem, child)
         child.cpu.eip = entry
         child.cpu.regs[4] = esp
         if new_session:
@@ -1023,7 +1072,7 @@ class Kernel:
                 was_shell = self._init_state == "wait_shell"
                 if child is not None:
                     code = child.exit_code
-                    del self.procs[child.pid]
+                    self._reap(child)
                     if was_shell:
                         self._write_console(
                             f"\nchild {child.pid} died with code {code:04x}\n")
@@ -1143,6 +1192,7 @@ class Kernel:
             self.current = p
             cpu = p.cpu
             before = cpu.icount
+            t0 = time.perf_counter()
             try:
                 cpu.run(TIMESLICE)
                 if cpu.halted:
@@ -1168,6 +1218,7 @@ class Kernel:
                 n = max(cpu.icount - before, 1)
                 total += n
                 p.utime += n
+                p.wall += time.perf_counter() - t0    # 按进程累计宿主墙钟耗时
                 self.jiffies += max(n * HZ // TIMESLICE, 1)
         return self.exit_status
 
