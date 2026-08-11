@@ -636,9 +636,14 @@ class TestProfile(unittest.TestCase):
         self.p = make_proc(self.k, self.fs)
         self.p.name = "/bin/testprog"
 
-    def test_info_profile_off_by_default(self):
+    def test_info_profile_overview_lists_process(self):
+        """概览常开: 即便没 prof on, 也按进程列出指令数/仿真时间/调用."""
+        self.p.utime = 1234
         out = run_monitor(self.k, ["info profile"])
-        self.assertIn("未开启", out)
+        self.assertIn("按进程性能", out)
+        self.assertIn("testprog", out)           # 程序列取 basename
+        self.assertIn("1,234", out)              # 指令数
+        self.assertIn("指令混合关", out)          # 提示 prof on
 
     def test_prof_on_off_toggles(self):
         out = run_monitor(self.k, ["prof on"])
@@ -650,20 +655,17 @@ class TestProfile(unittest.TestCase):
 
     def test_prof_reset(self):
         run_monitor(self.k, ["prof on"])
-        self.k._profiler.insns = 5
+        self.p.prof.insns = 5
         out = run_monitor(self.k, ["prof reset"])
         self.assertIn("清零", out)
-        self.assertEqual(self.k._profiler.insns, 0)
-
-    def test_prof_reset_without_enable(self):
-        self.assertIn("未开启", run_monitor(self.k, ["prof reset"]))
+        self.assertEqual(self.p.prof.insns, 0)
 
     def test_prof_unknown_subcommand_shows_usage(self):
         self.assertIn("用法", run_monitor(self.k, ["prof bogus"]))
 
-    def test_info_profile_renders_mix_and_derived(self):
+    def test_info_profile_detail_renders_mix_and_derived(self):
         self.k.set_profiling(True)
-        prof = self.k._profiler
+        prof = self.p.prof
         prof.insns = 100
         prof.cat_counts[cpu86.CAT_MOV] = 40
         prof.cat_counts[cpu86.CAT_ALU] = 30
@@ -672,8 +674,8 @@ class TestProfile(unittest.TestCase):
         prof.rep_elems = 500
         prof.hot = {0x1000 >> prof.bucket_shift: 60,
                     0x2000 >> prof.bucket_shift: 40}
-        out = run_monitor(self.k, ["info profile"])
-        self.assertIn("已剖析 100 条指令", out)
+        out = run_monitor(self.k, [f"info profile {self.p.pid}"])
+        self.assertIn("指令分布(采样 100 条)", out)
         self.assertIn("MOV", out)
         self.assertIn("40.0%", out)              # MOV 占比
         self.assertIn("分支", out)
@@ -682,6 +684,27 @@ class TestProfile(unittest.TestCase):
         self.assertIn("控制流密度    20.0%", out)
         self.assertIn("平均基本块长  5.0", out)
         self.assertIn("rep 放大倍数  50.0", out)
+
+    def test_info_profile_detail_shows_syscalls(self):
+        import ksyscall
+        self.p.syscall_counts[ksyscall.NR_WRITE] = 4
+        out = run_monitor(self.k, [f"info profile {self.p.pid}"])
+        self.assertIn("系统调用共 4 次", out)
+        self.assertIn("write", out)
+
+    def test_info_profile_detail_from_history(self):
+        """死进程也能按 pid 回看(从历史里取)."""
+        self.p.name = "/bin/gone"
+        self.p.utime = 999
+        pid = self.p.pid
+        self.k._reap(self.p)
+        out = run_monitor(self.k, [f"info profile {pid}"])
+        self.assertIn("已退出", out)
+        self.assertIn("/bin/gone", out)
+        self.assertIn("999", out)
+
+    def test_info_profile_unknown_pid(self):
+        self.assertIn("没有 pid", run_monitor(self.k, ["info profile 99999"]))
 
     def test_info_cpu_shows_profiling_state(self):
         self.assertIn("性能剖析: 关", run_monitor(self.k, ["info cpu"]))

@@ -161,9 +161,9 @@ def main(argv=None) -> int:
             dump = kmonitor.Monitor(k, write=lambda s: sys.stderr.write(s))
             dump.show_trace(k.trace_capacity)
         if a.profile:
-            # 与 monitor 的 `info profile` 同一份统计
+            # 与 monitor 的 `info profile` 同一份统计: 概览 + 每进程明细
             dump = kmonitor.Monitor(k, write=lambda s: sys.stderr.write(s))
-            dump.info_profile()
+            dump.dump_profile()
 
     if a.save_overlay:
         with open(a.save_overlay, "wb") as f:

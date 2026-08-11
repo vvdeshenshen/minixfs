@@ -52,7 +52,8 @@ info trace [n]    翻看轨迹缓冲里最近 n 条调用(默认 30)
 info cpu [pid]    寄存器与标志位
 info fds [pid]    文件描述符表
 info tty          终端与行规程状态
-info profile      CPU 性能剖析: 指令混合/热点/派生指标(需先 prof on)
+info profile      按进程性能: 指令数/仿真时间/系统调用(含已死进程历史)
+info profile <pid> 单个进程的指令分布/热点/系统调用(指令分布需 prof on)
 ps                = info procs
 regs [pid]        = info cpu
 kill <pid> [信号] 给被仿真进程发信号(默认 15/SIGTERM)
@@ -219,8 +220,8 @@ class Monitor:
             "fds": lambda: self.info_fds(rest),
             "fd": lambda: self.info_fds(rest),
             "tty": lambda: self.info_tty(),
-            "profile": lambda: self.info_profile(),
-            "prof": lambda: self.info_profile(),
+            "profile": lambda: self.info_profile(rest),
+            "prof": lambda: self.info_profile(rest),
             "trace": lambda: self.show_trace(
                 int(rest[0]) if rest and rest[0].lstrip("-").isdigit() else 30),
         }
@@ -526,76 +527,159 @@ class Monitor:
     # ---- 性能剖析 -----------------------------------------------------
 
     def cmd_prof(self, args: List[str]) -> None:
-        """prof on | off | reset —— 开关 CPU 性能剖析并清零计数.
+        """prof on | off | reset —— 开关 CPU 指令混合剖析并清零计数.
 
-        剖析默认关: cpu86 是纯 Python 解释器, 逐指令插桩有成本, 开着会拖慢
-        仿真, 所以要显式打开。开启后新建进程的 CPU 也自动挂上同一个剖析器。
+        指令混合剖析默认关: cpu86 是纯 Python 解释器, 逐指令插桩有成本, 开着会
+        拖慢仿真。(按进程的指令数/仿真时间/系统调用统计始终常开, 不受此开关影响,
+        info profile 随时能看。)
         """
         k = self.k
         sub = args[0].lower() if args else "show"
         if sub == "on":
             k.set_profiling(True)
-            self.out("CPU 性能剖析已开启(会拖慢仿真; info profile 看统计)。")
+            self.out("指令混合剖析已开启(会拖慢仿真; info profile 看统计)。")
             return
         if sub == "off":
             k.set_profiling(False)
-            self.out("CPU 性能剖析已关闭。")
+            self.out("指令混合剖析已关闭(常开的进程统计仍在)。")
             return
         if sub == "reset":
-            if not k.profiling:
-                self.out("剖析未开启(prof on 先打开)。")
-                return
             k.reset_profiling()
-            self.out("剖析计数已清零。")
+            self.out("现存进程的指令混合计数已清零。")
             return
         self.out(f"用法: prof on|off|reset(当前"
                  f"{'开' if k.profiling else '关'})")
 
-    def info_profile(self) -> None:
-        k = self.k
-        if not k.profiling or k._profiler is None:
-            self.out("CPU 性能剖析未开启。先在 monitor 里 `prof on`, "
-                     "或启动时加 --profile。")
-            return
-        prof = k._profiler
-        total = prof.insns
-        if total == 0:
-            self.out("剖析已开启, 但还没采到指令(让程序先跑一会儿)。")
-            return
-        self.out(f"已剖析 {total:,} 条指令。")
+    # ---- 按进程的性能视图 ----
 
-        # 指令混合: 按计数降序
-        self.out("指令混合(按类别):")
+    def _perf_entries(self) -> list:
+        """把活着的进程与历史里的死进程统一成一串性能条目."""
+        ents = []
+        for p in self.k.procs.values():
+            if p.kernel_task:                 # init 等内核任务无用户态, 跳过
+                continue
+            ents.append({
+                "pid": p.pid, "name": p.name or "?", "icount": p.utime,
+                "wall": p.wall, "syscalls": p.syscall_counts, "prof": p.prof,
+                "state": STATE_NAMES.get(p.state, "?"), "alive": True})
+        for r in self.k.proc_history:
+            ents.append({
+                "pid": r.pid, "name": r.name or "?", "icount": r.icount,
+                "wall": r.wall, "syscalls": r.syscalls, "prof": r.prof,
+                "state": f"退{(r.exit_code >> 8) & 0xFF}", "alive": False})
+        return ents
+
+    @staticmethod
+    def _basename(path: str) -> str:
+        return path.rsplit("/", 1)[-1] or path
+
+    def info_profile(self, args: Optional[List[str]] = None) -> None:
+        if args:
+            self._info_profile_one(args[0])
+            return
+        ents = self._perf_entries()
+        if not ents:
+            self.out("还没有可统计的进程。")
+            return
+        ents.sort(key=lambda e: -e["icount"])
+        self.out(f"按进程性能(活 {sum(e['alive'] for e in ents)} + 历史 "
+                 f"{sum(not e['alive'] for e in ents)}; 指令混合"
+                 f"{'开' if self.k.profiling else '关, prof on 打开'}):")
+        rows = []
+        for e in ents:
+            wall_ms = e["wall"] * 1000
+            speed = (f"{e['icount'] / e['wall'] / 1e6:.2f}"
+                     if e["wall"] > 1e-9 else "-")
+            prof = e["prof"]
+            if prof is not None and prof.insns:
+                i = max(range(len(cpu86.CAT_NAMES)),
+                        key=lambda k: prof.cat_counts[k])
+                top = f"{cpu86.CAT_NAMES[i]} {prof.cat_counts[i]*100/prof.insns:.0f}%"
+            else:
+                top = "-"
+            rows.append((e["pid"], self._basename(e["name"]), e["state"],
+                         f"{e['icount']:,}", f"{wall_ms:.1f}", speed,
+                         f"{sum(e['syscalls'].values()):,}", top))
+        for line in table(
+                ("pid", "程序", "状态", "指令数", "仿真ms", "M/s", "调用", "主类别"),
+                rows, aligns=["r", "l", "l", "r", "r", "r", "r", "l"]):
+            self.out("  " + line)
+        self.out("  (info profile <pid> 看单个进程的指令分布/热点/系统调用)")
+
+    def _info_profile_one(self, pid_str: str) -> None:
+        try:
+            pid = int(pid_str)
+        except ValueError:
+            self.out(f"无效 pid: {pid_str}")
+            return
+        e = next((x for x in self._perf_entries() if x["pid"] == pid), None)
+        if e is None:
+            self.out(f"没有 pid {pid} 的性能记录(活进程或历史里都没有)。")
+            return
+        wall_ms = e["wall"] * 1000
+        speed = (f"{e['icount'] / e['wall'] / 1e6:.2f} M/s"
+                 if e["wall"] > 1e-9 else "-")
+        tag = "活" if e["alive"] else "已退出"
+        self.out(f"pid {pid} ({e['name']})  [{tag}, {e['state']}]")
+        self.out(f"  指令数 {e['icount']:,}   仿真墙钟 {wall_ms:.1f}ms   速度 {speed}")
+
+        # 系统调用分布
+        sc = e["syscalls"]
+        if sc:
+            self.out(f"  系统调用共 {sum(sc.values()):,} 次:")
+            srows = [(self.syscall_name(nr), f"{n:,}")
+                     for nr, n in sorted(sc.items(), key=lambda kv: -kv[1])[:15]]
+            for line in table(("调用", "次数"), srows, aligns=["l", "r"]):
+                self.out("    " + line)
+        else:
+            self.out("  无系统调用记录。")
+
+        # 指令分布(需 prof on 时采集)
+        self._render_prof_detail(e["prof"])
+
+    def dump_profile(self) -> None:
+        """退出时的完整转储: 概览 + 每个进程的明细(供 --profile 用)."""
+        self.info_profile()
+        seen = set()
+        for e in sorted(self._perf_entries(), key=lambda x: -x["icount"]):
+            if e["pid"] in seen:
+                continue
+            seen.add(e["pid"])
+            self.out("")
+            self._info_profile_one(str(e["pid"]))
+
+    def _render_prof_detail(self, prof) -> None:
+        if prof is None or prof.insns == 0:
+            self.out("  指令分布: 未采集(prof on 后重跑该程序)。")
+            return
+        total = prof.insns
+        self.out(f"  指令分布(采样 {total:,} 条):")
         order = sorted(range(len(cpu86.CAT_NAMES)),
                        key=lambda i: -prof.cat_counts[i])
         rows = [(cpu86.CAT_NAMES[i], f"{prof.cat_counts[i]:,}",
                  f"{prof.cat_counts[i] * 100 / total:.1f}%")
                 for i in order if prof.cat_counts[i]]
         for line in table(("类别", "计数", "占比"), rows, aligns=["l", "r", "r"]):
-            self.out("  " + line)
+            self.out("    " + line)
 
-        # eip 热点: top 12 桶
         span = 1 << prof.bucket_shift
-        top = sorted(prof.hot.items(), key=lambda kv: -kv[1])[:12]
-        self.out(f"热点地址(每桶 {span}B, 前 {len(top)} 名):")
+        top = sorted(prof.hot.items(), key=lambda kv: -kv[1])[:10]
+        self.out(f"  热点地址(每桶 {span}B, 前 {len(top)} 名):")
         hrows = [(f"{b * span:#010x}-{b * span + span - 1:#06x}",
                   f"{n:,}", f"{n * 100 / total:.1f}%") for b, n in top]
         for line in table(("地址区间", "计数", "占比"), hrows,
                           aligns=["l", "r", "r"]):
-            self.out("  " + line)
+            self.out("    " + line)
 
-        # 派生指标
         c = prof.cat_counts
         mem_insns = sum(c[i] for i in cpu86._CAT_MEMORY)
         branches = c[cpu86.CAT_BRANCH]
         strings = c[cpu86.CAT_STRING]
-        self.out("派生指标:")
-        self.out(f"  访存指令占比  {mem_insns * 100 / total:.1f}%"
-                 f"(MOV+栈+串)")
-        self.out(f"  控制流密度    {branches * 100 / total:.1f}%"
-                 f"(分支指令 / 全部)")
+        self.out("  派生指标:")
+        self.out(f"    访存指令占比  {mem_insns * 100 / total:.1f}%(MOV+栈+串)")
+        self.out(f"    控制流密度    {branches * 100 / total:.1f}%(分支 / 全部)")
         avg_bb = total / branches if branches else float(total)
-        self.out(f"  平均基本块长  {avg_bb:.1f} 条 / 分支")
+        self.out(f"    平均基本块长  {avg_bb:.1f} 条 / 分支")
         if strings:
-            self.out(f"  rep 放大倍数  {prof.rep_elems / strings:.1f}"
+            self.out(f"    rep 放大倍数  {prof.rep_elems / strings:.1f}"
                      f"(串搬 {prof.rep_elems:,} 元素 / {strings:,} 条串指令)")
