@@ -83,6 +83,16 @@ cpu86.py → x86mem.py                              CPU 层不 import minixfs �
   `set_trace_capacity()` 调(monitor 的 trace on/off 与 --trace 都走它)。
   早先还并存一个无上限的 `Kernel.trace` 字符串列表, 既不含 pid 又没人读, 已删 ——
   不要再加回来。
+- **性能剖析分两档, 且按进程**(`info profile`, monitor `prof on/off/reset`,
+  `--profile`): ① 指令数(`p.utime`)、宿主墙钟(`p.wall`, 调度器每时间片测一次)、
+  系统调用计数(`p.syscall_counts`)**常开**, 开销可忽略; ② 指令混合/热点(cpu86 的
+  `Profiler`)**按需**, 逐指令插桩会拖慢主循环, 默认关。剖析器挂在 **Process** 上
+  不是 CPU 上 —— execve 换 CPU 后续用同一份(还是同一个二进制), fork 出的新
+  Process 自然是全新一份。进程被回收时 `_reap()` 把 `ProcPerf` 快照存进
+  `proc_history`(环形 200 条), 所以已死进程也能按 pid 回看。两处 reap(waitpid 与
+  init 收子进程)必须都走 `_reap`, 否则历史会漏。cpu86 层的零开销开关见下:
+  `CPU.run()` 顶部一句 `if self.prof: return self._run_profiled(...)`, 每时间片判一次,
+  关闭时热循环一字节不改 —— 别把插桩塞回 `run()`/`step()`。
 - **monitor 输出用 kmonitor.table() 排版**: 中文是双宽字符, Python 的 f"{s:<5}"
   按字符数补齐会让整张表错位, 必须用 dwidth/ljust/rjust 按显示列数算。
 - **退出途径只有转义键**: 交互时宿主终端是 raw 模式, Ctrl-C 会作为字节 0x03 进
