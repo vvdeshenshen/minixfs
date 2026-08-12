@@ -147,6 +147,11 @@ ktty.py          终端行规程与 termios
 test_*.py        474 个单元测试
 ```
 
+深入文档:
+
+- [x86 指令解码与仿真:算法与代码流程](docs/x86-decode-and-emulation.md)
+  —— CPU 层取指-解码-执行主线、ModRM/SIB 寻址、指令组、标志模型、串指令与异常路径。
+
 ## 测试
 
 ```bash
