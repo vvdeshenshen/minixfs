@@ -1200,7 +1200,7 @@ class Kernel:
             before = cpu.icount
             t0 = time.perf_counter()
             try:
-                if self.breakpoints or self.step_request:
+                if self.breakpoints or self.temp_breakpoints or self.step_request:
                     self._run_debug_slice(p, cpu)   # 逐指令, 查断点/步数
                 else:
                     cpu.run(TIMESLICE)              # 快路径: 一字节不改
@@ -1245,7 +1245,7 @@ class Kernel:
 
     def _debug_active(self) -> bool:
         """是否正处于调试(有断点、正在单步, 或 --debug 锁定了目标)."""
-        return bool(self.breakpoints or self.step_request
+        return bool(self.breakpoints or self.temp_breakpoints or self.step_request
                     or self.debug_target_pid is not None)
 
     def _debug_break(self, reason: tuple) -> None:
@@ -1272,8 +1272,11 @@ class Kernel:
                 if self.step_request == 0:
                     self._debug_break(("step", p.pid))
                     return
-            if cpu.eip in self.breakpoints or cpu.eip in self.temp_breakpoints:
+            if cpu.eip in self.temp_breakpoints:
                 self.temp_breakpoints.discard(cpu.eip)
+                self._debug_break(("until", p.pid, cpu.eip))
+                return
+            if cpu.eip in self.breakpoints:
                 self._debug_break(("break", p.pid, cpu.eip))
                 return
 
