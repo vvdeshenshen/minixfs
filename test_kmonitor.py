@@ -799,6 +799,26 @@ class TestDebugMonitor(unittest.TestCase):
         k.run(2_000_000)
         self.assertIn("HELLO", run_monitor(k, ["info console"]))
 
+    def test_enter_repeats_last_command(self):
+        """空行(回车)重复上一条 si —— 连按回车反复单步。"""
+        k, p = self._boot(b"\x90\x90\x90\x90\xf4")
+        out = self._drive(k, ["si", "", "", "cont"])
+        self.assertIn("00000001:", out)          # 第一次 si
+        self.assertIn("00000003:", out)          # 两次回车又走了两步
+
+    def test_layout_shows_three_panes(self):
+        k, p = self._boot(self.NOPHALT)
+        out = self._drive(k, ["layout on", "si", "cont"])
+        self.assertIn("反汇编", out)
+        self.assertIn("寄存器", out)
+        self.assertIn("栈", out)
+        self.assertIn("<- esp", out)
+
+    def test_empty_line_without_history_is_noop(self):
+        k, term, fs = make_monitored()
+        mon = Monitor(k)
+        self.assertFalse(mon.dispatch(""))       # 无历史时空行什么都不做
+
 
 if __name__ == "__main__":
     unittest.main()

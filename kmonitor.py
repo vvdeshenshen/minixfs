@@ -70,6 +70,8 @@ disas [addr] [n]  反汇编 n 条(默认从 eip 起 8 条)
 x /NFU addr       检查内存: N 个单位, 格式 x/d/u/c/i, 单位 b/h/w(i=反汇编)
 break <addr>      设断点; break list 列出; break del <addr|all> 删除
 until <addr>      运行到该地址(一次性断点)
+layout [on|off]   gdb 风格三栏视图(反汇编/寄存器/栈); 停下时自动刷新
+(回车)            空行重复上一条命令(连按回车即可反复 si 单步)
 cont              退出 monitor 继续跑(断点仍会命中)
 quit              停止仿真并退出
 help              这份帮助
@@ -131,6 +133,8 @@ class Monitor:
         self._read_line = read_line
         self._write = write
         self._last_addr = None          # x / disas 续址
+        self._last_cmd = ""             # 空行(回车)重复的上一条命令
+        self._layout = False            # gdb 风格 layout: 停下时显示反汇编/寄存器/栈
 
     # ---- 输入输出(可注入) ----------------------------------------------
 
@@ -176,11 +180,19 @@ class Monitor:
                 term.resume()
 
     def dispatch(self, line: str) -> bool:
-        """执行一条命令; 返回 True 表示该离开 monitor."""
+        """执行一条命令; 返回 True 表示该离开 monitor.
+
+        空行(直接回车)重复上一条命令 —— 仿 gdb, 便于连按回车反复 si 单步。
+        """
         if not line:
-            return False
+            line = self._last_cmd
+            if not line:
+                return False
         parts = line.split()
         cmd, args = parts[0].lower(), parts[1:]
+        # 离开类命令不记为"上一条", 免得回车重进后误触发
+        if cmd not in ("cont", "c", "continue", "quit", "q", "exit"):
+            self._last_cmd = line
         if cmd in ("cont", "c", "continue"):
             self.out("继续仿真。")
             return True
@@ -222,6 +234,9 @@ class Monitor:
             return False
         if cmd == "until":
             return self.cmd_until(args)
+        if cmd in ("layout", "lay"):
+            self.cmd_layout(args)
+            return False
         self.out(f"未知命令: {cmd}(输入 help 看命令)")
         return False
 
@@ -749,8 +764,61 @@ class Monitor:
         else:
             self.out(f"[{desc}] pid {pid}")
         if p is not None and p.cpu is not None:
-            self.out("  " + self._cur_insn(p))
-            self.out("  " + self._regline(p.cpu))
+            if self._layout:
+                self._render_layout(p)
+            else:
+                self.out("  " + self._cur_insn(p))
+                self.out("  " + self._regline(p.cpu))
+
+    def cmd_layout(self, args: List[str]) -> None:
+        """layout [on|off] —— gdb 风格视图: 停下时显示反汇编/寄存器/栈三栏。
+
+        无参数时切换开关; 开启(或已开)时立即渲染一次当前进程的视图。
+        """
+        sub = args[0].lower() if args else "toggle"
+        if sub in ("off", "none", "0", "no"):
+            self._layout = False
+            self.out("layout 已关闭(停下只显示一行)。")
+            return
+        if sub in ("on", "asm", "1", "yes"):
+            self._layout = True
+        else:                                    # toggle
+            self._layout = not self._layout
+        if not self._layout:
+            self.out("layout 已关闭(停下只显示一行)。")
+            return
+        self.out("layout 已开启(单步/断点停下会显示三栏; 回车重复上一条命令)。")
+        p = self._debug_proc()
+        if p is not None and p.cpu is not None:
+            self._render_layout(p)
+
+    def _render_layout(self, p) -> None:
+        """三栏视图: 反汇编窗口(当前 eip 起 8 条, → 标当前) + 寄存器 + 栈顶。"""
+        cpu = p.cpu
+        self.out("── 反汇编 " + "─" * 34)
+        for a, raw, text in cpu_disasm.disasm_range(p.mem, cpu.eip, 8):
+            mark = "→" if a == cpu.eip else " "
+            self.out(f" {mark} {a:08x}: {raw.hex(' '):<20} {text}")
+        self.out("── 寄存器 " + "─" * 34)
+        names = ("eax", "ecx", "edx", "ebx", "esp", "ebp", "esi", "edi")
+        for i in range(0, 8, 4):
+            self.out("  " + "  ".join(
+                f"{names[j]}={cpu.regs[j]:08x}" for j in range(i, i + 4)))
+        f = cpu.eflags
+        flags = "".join(ch for ch, bit in
+                        (("C", 0x1), ("P", 0x4), ("A", 0x10), ("Z", 0x40),
+                         ("S", 0x80), ("D", 0x400), ("O", 0x800)) if f & bit)
+        self.out(f"  eip={cpu.eip:08x}  eflags={f:#06x} [{flags or '-'}]")
+        self.out("── 栈 " + "─" * 38)
+        esp = cpu.regs[4]
+        for i in range(6):
+            a = (esp + i * 4) & 0xFFFFFFFF
+            try:
+                v = p.mem.read_u32(a)
+            except Exception:
+                break
+            top = "  <- esp" if i == 0 else ""
+            self.out(f"  {a:08x}: 0x{v:08x}{top}")
 
     def cmd_step(self, args: List[str]) -> bool:
         """si / stepi [n]: 单步 n 条; 置 step_request 后离开 monitor 让调度器跑。"""
