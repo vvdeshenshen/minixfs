@@ -93,6 +93,16 @@ cpu86.py → x86mem.py                              CPU 层不 import minixfs �
   init 收子进程)必须都走 `_reap`, 否则历史会漏。cpu86 层的零开销开关见下:
   `CPU.run()` 顶部一句 `if self.prof: return self._run_profiled(...)`, 每时间片判一次,
   关闭时热循环一字节不改 —— 别把插桩塞回 `run()`/`step()`。
+- **单步调试是 gdb 风格, 靠 monitor_pending 乒乓**(monitor `si/disas/x/break/until`,
+  `--debug PROG`): 调度器只在有断点/临时断点/`step_request` 时才把 `cpu.run(TIMESLICE)`
+  换成 `_run_debug_slice`(逐指令 `cpu.run(1)`), 否则原样跑 —— 非调试运行逐字节不变。
+  **断点执行后检查**(停时 eip==X 且未执行, 从断点 cont 先执行 X 再查, 不会重命中);
+  单步用 `cpu.run(1)` 不用 `step()`(前者才记 icount/走 on_fault/剖析器)。`si` 命令置
+  `step_request` 后**离开** monitor 让调度器跑, 再经 `monitor_pending` 重进, 靠
+  `k.debug_stop`(停因元组)让 `interact()` 抑制 banner 并打印现场 —— 所以现有 monitor
+  测试(不设 debug_stop)全不受影响。反汇编在**独立的只读 `cpu_disasm.py`**(镜像
+  `_execute`/`_modrm`, 绝不执行), 长度必须与执行器一致(有长度对照单测), 否则多条
+  反汇编会串行错位。控制台输出留存在 `TTY.console_tail`(逻辑输出, ONLCR 展开前)。
 - **monitor 输出用 kmonitor.table() 排版**: 中文是双宽字符, Python 的 f"{s:<5}"
   按字符数补齐会让整张表错位, 必须用 dwidth/ljust/rjust 按显示列数算。
 - **退出途径只有转义键**: 交互时宿主终端是 raw 模式, Ctrl-C 会作为字节 0x03 进

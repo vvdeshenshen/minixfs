@@ -137,14 +137,25 @@ pager.py         less 风格分页器, 终端尺寸/按键/输出均可注入
 
 emulator.py      仿真器入口
 cpu86.py         i386 用户态指令解释器
+cpu_disasm.py    只读 Intel 反汇编器(单步调试用)
 x86mem.py        双区平坦地址空间
 kvfs.py          写入覆盖层(COW)、管道、设备表
 kexec.py         a.out ZMAGIC 加载器与初始栈
 ksyscall.py      系统调用表与常量
 kernel.py        进程/fd/信号/调度
 ktty.py          终端行规程与 termios
+kmonitor.py      qemu 风格 monitor(含 gdb 风格单步调试)
 
-test_*.py        474 个单元测试
+test_*.py        636 个单元测试
+```
+
+单步调试(gdb 风格):
+
+```bash
+# 执行第 0 条前先停进 monitor, 然后 si 单步 / disas 反汇编 / x 查内存 / break 断点
+python3 emulator.py hdc-0.11.img --debug /bin/date
+# monitor 里也随时可用: si、disas [addr] [n]、x/NFU addr、break <addr>、until <addr>、
+#                        info console(控制台输出)
 ```
 
 深入文档:
