@@ -189,6 +189,12 @@ class Kernel:
         # 的指令数/仿真时间/系统调用统计是常开的(开销可忽略), 死后进 proc_history。
         self.profiling = False
         self.proc_history: deque = deque(maxlen=PERF_HISTORY)
+        # 单步调试(gdb 风格): 默认全空, 调度器快路径不受影响。
+        self.breakpoints: set = set()            # 永久断点 eip 集合
+        self.temp_breakpoints: set = set()       # until 的一次性断点
+        self.step_request = 0                    # 还要单步几条(0=不在单步)
+        self.debug_stop = None                   # 停因元组, 供 monitor 进入时展示
+        self.debug_target_pid = None             # --debug 的目标进程(锁定单步对象)
 
     # ---- 进程创建 -----------------------------------------------------
 
@@ -1194,17 +1200,28 @@ class Kernel:
             before = cpu.icount
             t0 = time.perf_counter()
             try:
-                cpu.run(TIMESLICE)
+                if self.breakpoints or self.step_request:
+                    self._run_debug_slice(p, cpu)   # 逐指令, 查断点/步数
+                else:
+                    cpu.run(TIMESLICE)              # 快路径: 一字节不改
                 if cpu.halted:
                     self._exit_process(p, 0)
+                    if self._debug_active():
+                        self._debug_break(("halted", p.pid))
             except Exited as e:
+                if self._debug_active():
+                    self._debug_break(("exited", p.pid, e.code))
                 self._exit_process(p, e.code)
                 if p.ppid == 0:
                     return e.code
             except Replaced:
-                pass                         # execve 已换好新 CPU, 下轮继续跑它
+                if self._debug_active():
+                    self._debug_break(("execve", p.pid))
+                # execve 已换好新 CPU, 下轮继续跑它
             except MagicJump:
                 self._sigreturn(p)
+                if self._debug_active():
+                    self._debug_break(("sigreturn", p.pid))
             except Blocked as e:
                 p.state = SLEEPING
                 p.wait_channel = e.channel
@@ -1212,6 +1229,8 @@ class Kernel:
                 cpu.eip -= 2                 # int 0x80 是 CD 80 两字节, 回卷重做
                 if p.pid in self.runq:
                     self.runq.remove(p.pid)
+                if self._debug_active():
+                    self._debug_break(("blocked", p.pid, e.channel))
             finally:
                 # 用 icount 差值记账 —— 阻塞/退出都是异常路径, 靠 run() 的
                 # 返回值会漏记, 导致 max_instructions 永远到不了。
@@ -1221,6 +1240,42 @@ class Kernel:
                 p.wall += time.perf_counter() - t0    # 按进程累计宿主墙钟耗时
                 self.jiffies += max(n * HZ // TIMESLICE, 1)
         return self.exit_status
+
+    # ---- 单步调试 -----------------------------------------------------
+
+    def _debug_active(self) -> bool:
+        """是否正处于调试(有断点、正在单步, 或 --debug 锁定了目标)."""
+        return bool(self.breakpoints or self.step_request
+                    or self.debug_target_pid is not None)
+
+    def _debug_break(self, reason: tuple) -> None:
+        """记下停因并请求进入 monitor; 顺带清空残留步数以免串到别的进程."""
+        self.step_request = 0
+        self.debug_stop = reason
+        self.monitor_pending = True
+
+    def _run_debug_slice(self, p: Process, cpu) -> None:
+        """调试激活时的逐指令时间片: 每执行一条就查断点/步数, 命中即进 monitor。
+
+        断点**执行后**检查: 停时 eip==X 且 X 尚未执行(gdb 语义); 从断点 cont 时先
+        执行 X 再检查, 天然不会立刻重命中同一断点。异常(Exited/Blocked/...)由
+        cpu.run(1) 抛出, 一路穿回 run() 的异常臂处理。
+        """
+        budget = 1 if self.step_request else TIMESLICE
+        pinned = self.debug_target_pid in (None, p.pid)
+        ran = 0
+        while ran < budget and not cpu.halted:
+            cpu.run(1)                      # 执行 eip 处一条; 递增 icount
+            ran += 1
+            if self.step_request and pinned:
+                self.step_request -= 1
+                if self.step_request == 0:
+                    self._debug_break(("step", p.pid))
+                    return
+            if cpu.eip in self.breakpoints or cpu.eip in self.temp_breakpoints:
+                self.temp_breakpoints.discard(cpu.eip)
+                self._debug_break(("break", p.pid, cpu.eip))
+                return
 
     def _sigreturn(self, p: Process) -> None:
         """兜底的信号返回: 弹出 _build_signal_frame 压下的帧.

@@ -1412,5 +1412,74 @@ class TestProfiling(unittest.TestCase):
         self.assertTrue(p.prof.hot)
 
 
+# ---------------------------------------------------------------------------
+# 单步调试原语
+# ---------------------------------------------------------------------------
+
+class TestDebugPrimitives(unittest.TestCase):
+    def _boot(self, code):
+        k, term, fs = make_kernel()
+        v = fs.create("/prog", 0o755)
+        fs.write(v, 0, make_aout(code))
+        p = k.boot("/prog", [b"/prog"])
+        return k, p
+
+    def test_single_step_advances_one(self):
+        k, p = self._boot(b"\x90\x90\x90\xf4")     # nop nop nop hlt
+        k.step_request = 1
+        k._run_debug_slice(p, p.cpu)
+        self.assertEqual(p.cpu.icount, 1)
+        self.assertEqual(p.cpu.eip, 1)             # 越过一条 nop
+        self.assertEqual(k.step_request, 0)
+        self.assertEqual(k.debug_stop[0], "step")
+        self.assertTrue(k.monitor_pending)
+
+    def test_breakpoint_stops_before_executing(self):
+        k, p = self._boot(b"\x90\x90\x90\xf4")
+        k.breakpoints = {2}                        # 停在 eip==2, 该条尚未执行
+        k._run_debug_slice(p, p.cpu)
+        self.assertEqual(p.cpu.eip, 2)
+        self.assertEqual(k.debug_stop, ("break", p.pid, 2))
+        self.assertTrue(k.monitor_pending)
+
+    def test_resume_does_not_immediately_rehit(self):
+        k, p = self._boot(b"\x90\x90\x90\xf4")
+        k.breakpoints = {2}
+        k._run_debug_slice(p, p.cpu)               # 停在 2
+        k.monitor_pending = False
+        k._run_debug_slice(p, p.cpu)               # 从 2 恢复: 先执行 2 再查
+        self.assertTrue(p.cpu.halted)              # 跑到 hlt, 没在 2 重命中
+        self.assertGreater(p.cpu.eip, 2)
+
+    def test_step_pinned_to_target(self):
+        k, p = self._boot(b"\x90\x90\x90\xf4")
+        k.debug_target_pid = 99999                 # 不是 p, 不该消耗步数
+        k.step_request = 1
+        k._run_debug_slice(p, p.cpu)
+        self.assertEqual(p.cpu.icount, 1)          # 仍执行(budget=1)
+        self.assertEqual(k.step_request, 1)        # 但步数不减(非目标)
+        self.assertFalse(k.monitor_pending)
+
+    def test_debug_active_and_break_reset(self):
+        k, _, _ = make_kernel()
+        self.assertFalse(k._debug_active())
+        k.step_request = 5
+        self.assertTrue(k._debug_active())
+        k._debug_break(("step", 1))
+        self.assertEqual(k.step_request, 0)        # 清空残留步数
+        self.assertEqual(k.debug_stop, ("step", 1))
+        self.assertTrue(k.monitor_pending)
+
+    def test_fast_path_when_not_debugging(self):
+        """不调试时整段 hello 一次跑完(走 cpu.run(TIMESLICE) 快路径)."""
+        k, term, fs = make_kernel()
+        v = fs.create("/prog", 0o755)
+        fs.write(v, 0, make_aout(hello_program(b"x")))
+        k.boot("/prog", [b"/prog"])
+        k.run(2_000_000)
+        self.assertFalse(k._debug_active())
+        self.assertIsNone(k.debug_stop)
+
+
 if __name__ == "__main__":
     unittest.main()
