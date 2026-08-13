@@ -158,10 +158,16 @@ python3 emulator.py hdc-0.11.img --debug /bin/date
 #                        info console(控制台输出)
 ```
 
-深入文档:
+深入文档(算法与代码流程, 见 [docs/](docs/)):
 
-- [x86 指令解码与仿真:算法与代码流程](docs/x86-decode-and-emulation.md)
-  —— CPU 层取指-解码-执行主线、ModRM/SIB 寻址、指令组、标志模型、串指令与异常路径。
+- [docs/emulator-overview.md](docs/emulator-overview.md) —— 仿真器总体架构与引导链(先读这篇)
+- [docs/x86-decode-and-emulation.md](docs/x86-decode-and-emulation.md) —— CPU 指令解码与仿真
+- [docs/kernel-process-and-scheduler.md](docs/kernel-process-and-scheduler.md) —— 进程/调度器/信号
+- [docs/syscalls-and-loading.md](docs/syscalls-and-loading.md) —— 系统调用与 a.out 装载
+- [docs/vfs-overlay-pipes-devices.md](docs/vfs-overlay-pipes-devices.md) —— 写时复制 VFS/管道/设备
+- [docs/terminal-and-line-discipline.md](docs/terminal-and-line-discipline.md) —— 终端与行规程
+- [docs/monitor-and-debugger.md](docs/monitor-and-debugger.md) —— monitor 与单步调试器
+- [docs/minixfs-and-browser.md](docs/minixfs-and-browser.md) —— Minix v1 解析库与浏览器
 
 ## 测试
 
