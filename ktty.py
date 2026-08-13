@@ -9,6 +9,7 @@ ioctl 请求码与 struct termios 布局取自镜像内核 include/termios.h。
 
 from __future__ import annotations
 
+import collections
 import os
 import select
 import struct
@@ -401,6 +402,8 @@ class TTY:
         self.escape = escape
         self.on_escape = on_escape
         self._escape_armed = False
+        # 控制台输出留存(供 monitor 的 info console 回看最近输出), 环形字节缓冲
+        self.console_tail = collections.deque(maxlen=8192)
         if not term.is_tty():
             # 非交互: 关回显, 免得污染输出
             self.termios.lflag &= ~(ECHO | ECHOE | ECHOK | ECHOCTL)
@@ -540,6 +543,7 @@ class TTY:
         if t.oflag & OPOST and t.oflag & ONLCR and self.term.is_tty():
             out = data.replace(b"\n", b"\r\n")
         self.term.write_out(out)
+        self.console_tail.extend(data)          # 留存逻辑输出(ONLCR 展开前)
         return len(data)
 
     # ---- ioctl --------------------------------------------------------

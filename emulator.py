@@ -104,6 +104,8 @@ def main(argv=None) -> int:
                     help="启动时加载之前导出的覆盖层")
     ap.add_argument("--monitor", action="store_true",
                     help="启动后先进入 monitor 控制台")
+    ap.add_argument("--debug", action="store_true",
+                    help="单步调试: 执行第 0 条前先停进 monitor(可 si/disas/break)")
     ap.add_argument("--escape", metavar="CHAR", default="a",
                     help="monitor 转义键(默认 a, 即 Ctrl-A); 传 none 关闭")
     a = ap.parse_args(head)
@@ -141,14 +143,16 @@ def main(argv=None) -> int:
             k.boot_init()               # 内核 init(): /etc/rc -> login shell
         else:
             argv_list = [program.encode()] + [x.encode() for x in prog_args]
-            k.boot(program, argv_list)
+            p = k.boot(program, argv_list)
+            if a.debug:
+                k.debug_target_pid = p.pid    # 锁定单步对象
     except (FsError, ExecError) as e:
         term.restore()
         print(f"启动失败: {e}", file=sys.stderr)
         return 1
 
-    if a.monitor:
-        k.monitor_pending = True
+    if a.monitor or a.debug:
+        k.monitor_pending = True            # 执行第 0 条前就停进 monitor
 
     try:
         code = k.run(a.max_insns)

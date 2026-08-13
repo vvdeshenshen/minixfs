@@ -712,5 +712,93 @@ class TestProfile(unittest.TestCase):
         self.assertIn("性能剖析: 开", run_monitor(self.k, ["info cpu"]))
 
 
+class TestDebugMonitor(unittest.TestCase):
+    """gdb 风格单步调试 —— 驱动调度器与 monitor 的 monitor_pending 乒乓。"""
+
+    def _boot(self, code):
+        from test_kernel import make_aout
+        k, term, fs = make_monitored()
+        v = fs.create("/prog", 0o755)
+        fs.write(v, 0, make_aout(code))
+        p = k.boot("/prog", [b"/prog"])
+        k.debug_target_pid = p.pid
+        return k, p
+
+    def _drive(self, k, commands, bound=2_000_000):
+        out = []
+        it = iter(commands)
+        mon = Monitor(k, read_line=lambda prompt: next(it),
+                      write=lambda s: out.append(s))
+        k.monitor = mon
+        k.monitor_pending = True
+        k.run(bound)
+        return "".join(out)
+
+    NOPHALT = b"\x90\x90\x90\xf4"          # nop nop nop hlt
+
+    def test_single_step_shows_disasm_and_regs(self):
+        k, p = self._boot(self.NOPHALT)
+        out = self._drive(k, ["si", "cont"])
+        self.assertIn("单步", out)
+        self.assertIn("00000001:", out)     # 走了一条 nop
+        self.assertIn("nop", out)
+        self.assertIn("eax=", out)          # 寄存器行
+
+    def test_stepi_count(self):
+        k, p = self._boot(b"\x90\x90\x90\x90\xf4")
+        out = self._drive(k, ["stepi 3", "cont"])
+        self.assertIn("00000003:", out)     # 单步 3 条后停在 eip=3
+
+    def test_breakpoint_hits_before_executing(self):
+        k, p = self._boot(self.NOPHALT)
+        out = self._drive(k, ["break 0x2", "cont", "cont"])
+        self.assertIn("已设断点 0x2", out)
+        self.assertIn("命中断点 0x2", out)
+        self.assertIn("00000002:", out)
+
+    def test_breakpoint_not_rehit_on_resume(self):
+        k, p = self._boot(self.NOPHALT)
+        out = self._drive(k, ["break 0x1", "cont", "cont", "cont"])
+        self.assertEqual(out.count("命中断点 0x1"), 1)   # 只命中一次
+
+    def test_break_list_and_del(self):
+        k, p = self._boot(self.NOPHALT)
+        out = self._drive(k, ["break 0x2", "break 0x3", "break list",
+                              "break del 0x2", "break list", "cont"])
+        self.assertIn("0x3", out)
+        self.assertIn("已删断点 0x2", out)
+
+    def test_disas_marks_current(self):
+        k, p = self._boot(self.NOPHALT)
+        out = self._drive(k, ["disas 0x0 3", "cont"])
+        self.assertIn("→ 00000000:", out)   # 当前 eip 标注
+        self.assertIn("nop", out)
+
+    def test_x_examine_words(self):
+        k, p = self._boot(b"\x78\x56\x34\x12\xf4")   # 数据字节 + hlt
+        out = self._drive(k, ["x/1xw 0x0", "cont"])
+        self.assertIn("0x12345678", out)
+
+    def test_x_examine_instructions(self):
+        k, p = self._boot(self.NOPHALT)
+        out = self._drive(k, ["x/2i eip", "cont"])
+        self.assertIn("nop", out)
+
+    def test_until_runs_to_addr(self):
+        k, p = self._boot(self.NOPHALT)
+        out = self._drive(k, ["until 0x2", "cont"])
+        self.assertIn("运行到", out)
+        self.assertIn("00000002:", out)
+
+    def test_info_console_shows_output(self):
+        from test_kernel import make_aout, hello_program
+        k, term, fs = make_kernel()
+        v = fs.create("/prog", 0o755)
+        fs.write(v, 0, make_aout(hello_program(b"HELLO\n")))
+        k.boot("/prog", [b"/prog"])
+        k.run(2_000_000)
+        self.assertIn("HELLO", run_monitor(k, ["info console"]))
+
+
 if __name__ == "__main__":
     unittest.main()

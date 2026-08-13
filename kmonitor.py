@@ -20,6 +20,7 @@ import unicodedata
 from typing import Callable, List, Optional
 
 import cpu86
+import cpu_disasm
 import kernel as kmod
 import kvfs
 
@@ -54,6 +55,7 @@ info fds [pid]    文件描述符表
 info tty          终端与行规程状态
 info profile      按进程性能: 指令数/仿真时间/系统调用(含已死进程历史)
 info profile <pid> 单个进程的指令分布/热点/系统调用(指令分布需 prof on)
+info console      最近的控制台输出
 ps                = info procs
 regs [pid]        = info cpu
 kill <pid> [信号] 给被仿真进程发信号(默认 15/SIGTERM)
@@ -62,7 +64,13 @@ trace on [容量]   放大轨迹缓冲以留更长历史(默认 5000 条)
 trace off         缩回默认容量(轨迹始终在记, 只是历史更短)
 prof on|off       开关 CPU 性能剖析(默认关; 开着会拖慢仿真)
 prof reset        清零剖析计数
-cont              退出 monitor, 继续仿真
+── 单步调试(gdb 风格)──
+si / stepi [n]    单步执行 n 条指令(默认 1), 停后显示反汇编与寄存器
+disas [addr] [n]  反汇编 n 条(默认从 eip 起 8 条)
+x /NFU addr       检查内存: N 个单位, 格式 x/d/u/c/i, 单位 b/h/w(i=反汇编)
+break <addr>      设断点; break list 列出; break del <addr|all> 删除
+until <addr>      运行到该地址(一次性断点)
+cont              退出 monitor 继续跑(断点仍会命中)
 quit              停止仿真并退出
 help              这份帮助
 """
@@ -122,6 +130,7 @@ class Monitor:
         self.k = kernel
         self._read_line = read_line
         self._write = write
+        self._last_addr = None          # x / disas 续址
 
     # ---- 输入输出(可注入) ----------------------------------------------
 
@@ -147,8 +156,12 @@ class Monitor:
         if term is not None and hasattr(term, "suspend"):
             term.suspend()                 # 暂时恢复宿主终端的常规模式
         try:
-            self.out()
-            self.out("已进入 monitor(输入 help 看命令, cont 继续仿真, quit 退出)")
+            if self.k.debug_stop is not None:
+                self._print_debug_stop(self.k.debug_stop)
+                self.k.debug_stop = None
+            else:
+                self.out()
+                self.out("已进入 monitor(输入 help 看命令, cont 继续仿真, quit 退出)")
             while True:
                 try:
                     line = self.read_line()
@@ -196,6 +209,19 @@ class Monitor:
         if cmd == "prof":
             self.cmd_prof(args)
             return False
+        if cmd in ("si", "stepi", "step", "s"):
+            return self.cmd_step(args)
+        if cmd in ("disas", "disassemble", "u"):
+            self.cmd_disas(args)
+            return False
+        if cmd == "x" or cmd.startswith("x/"):
+            self.cmd_x(([cmd[1:]] + args) if cmd != "x" else args)
+            return False
+        if cmd in ("break", "b", "bp"):
+            self.cmd_break(args)
+            return False
+        if cmd == "until":
+            return self.cmd_until(args)
         self.out(f"未知命令: {cmd}(输入 help 看命令)")
         return False
 
@@ -203,7 +229,8 @@ class Monitor:
 
     def cmd_info(self, args: List[str]) -> None:
         if not args:
-            self.out("用法: info procs|mem|fs|syscalls|trace|cpu|fds|tty|profile")
+            self.out("用法: info procs|mem|fs|syscalls|trace|cpu|fds|tty|"
+                     "profile|console")
             return
         what = args[0].lower()
         rest = args[1:]
@@ -222,6 +249,7 @@ class Monitor:
             "tty": lambda: self.info_tty(),
             "profile": lambda: self.info_profile(rest),
             "prof": lambda: self.info_profile(rest),
+            "console": lambda: self.info_console(rest),
             "trace": lambda: self.show_trace(
                 int(rest[0]) if rest and rest[0].lstrip("-").isdigit() else 30),
         }
@@ -683,3 +711,216 @@ class Monitor:
         if strings:
             self.out(f"    rep 放大倍数  {prof.rep_elems / strings:.1f}"
                      f"(串搬 {prof.rep_elems:,} 元素 / {strings:,} 条串指令)")
+
+    # ---- 单步调试 -----------------------------------------------------
+
+    STOP_DESC = {"step": "单步", "break": "命中断点", "until": "运行到",
+                 "exited": "进程退出", "blocked": "阻塞", "execve": "execve 换映像",
+                 "sigreturn": "信号返回", "halted": "halt 停机"}
+
+    def _debug_proc(self):
+        """当前调试目标进程(优先 debug_target_pid, 否则当前有 CPU 的进程)."""
+        pid = self.k.debug_target_pid
+        if pid is not None and pid in self.k.procs:
+            return self.k.procs[pid]
+        return self._pick_proc([])
+
+    def _regline(self, cpu) -> str:
+        n = ("eax", "ecx", "edx", "ebx", "esp", "ebp", "esi", "edi")
+        return " ".join(f"{n[j]}={cpu.regs[j]:08x}" for j in range(8))
+
+    def _cur_insn(self, p) -> str:
+        length, text, raw = cpu_disasm.disasm_one(p.mem, p.cpu.eip)
+        return f"{p.cpu.eip:08x}: {raw.hex(' '):<20} {text}"
+
+    def _print_debug_stop(self, reason: tuple) -> None:
+        kind = reason[0]
+        desc = self.STOP_DESC.get(kind, kind)
+        pid = reason[1] if len(reason) > 1 else None
+        p = self.k.procs.get(pid) if pid is not None else None
+        if kind in ("break", "until"):
+            self.out(f"[{desc} 0x{reason[2]:x}] pid {pid}")
+        elif kind == "exited":
+            self.out(f"[{desc}] pid {pid} 退出码 {reason[2] >> 8}")
+            return
+        elif kind == "blocked":
+            self.out(f"[{desc}] pid {pid} 等待 {reason[2]}(该进程已睡眠, "
+                     f"用 cont 让它继续)")
+        else:
+            self.out(f"[{desc}] pid {pid}")
+        if p is not None and p.cpu is not None:
+            self.out("  " + self._cur_insn(p))
+            self.out("  " + self._regline(p.cpu))
+
+    def cmd_step(self, args: List[str]) -> bool:
+        """si / stepi [n]: 单步 n 条; 置 step_request 后离开 monitor 让调度器跑。"""
+        p = self._debug_proc()
+        if p is None or p.cpu is None:
+            self.out("没有可单步的用户态进程。")
+            return False
+        if p.state != kmod.RUNNING:
+            self.out(f"pid {p.pid} 当前不可运行({STATE_NAMES.get(p.state, '?')}), "
+                     f"用 cont 让它继续。")
+            return False
+        n = 1
+        if args:
+            try:
+                n = max(int(args[0]), 1)
+            except ValueError:
+                self.out(f"步数必须是整数: {args[0]}")
+                return False
+        self.k.step_request = n
+        return True                          # 离开 monitor, 由调度器执行并回来
+
+    def cmd_disas(self, args: List[str]) -> None:
+        p = self._debug_proc()
+        if p is None or p.cpu is None:
+            self.out("没有可反汇编的进程。")
+            return
+        count = 8
+        addr = p.cpu.eip
+        rest = list(args)
+        if rest and not rest[-1].startswith("0x") and rest[-1].isdigit() \
+                and len(rest) >= 2:
+            count = int(rest.pop())
+        if rest:
+            a = self._parse_addr(rest[0], p)
+            if a is None:
+                return
+            addr = a
+        elif self._last_addr is not None and not args:
+            addr = self._last_addr
+        cur = p.cpu.eip
+        for a, raw, text in cpu_disasm.disasm_range(p.mem, addr, count):
+            mark = "→" if a == cur else " "
+            self.out(f"{mark} {a:08x}: {raw.hex(' '):<20} {text}")
+            self._last_addr = (a + len(raw)) & 0xFFFFFFFF
+
+    def cmd_x(self, args: List[str]) -> None:
+        """x /NFU addr —— 检查内存。N 个单位, 格式 x/d/u/c/i, 单位 b/h/w。"""
+        p = self._debug_proc()
+        if p is None or p.cpu is None:
+            self.out("没有进程可查内存。")
+            return
+        count, fmt, unit = 1, "x", "w"
+        rest = list(args)
+        if rest and rest[0].startswith("/"):
+            spec = rest.pop(0)[1:]
+            num = "".join(c for c in spec if c.isdigit())
+            if num:
+                count = int(num)
+            for c in spec:
+                if c in "xduci":
+                    fmt = c
+                elif c in "bhw":
+                    unit = c
+        addr = self._last_addr if (not rest and self._last_addr is not None) \
+            else None
+        if rest:
+            addr = self._parse_addr(rest[0], p)
+        if addr is None:
+            self.out("用法: x /NFU addr(如 x/8xw 0x1000, x/5i eip)")
+            return
+        if fmt == "i":
+            for a, raw, text in cpu_disasm.disasm_range(p.mem, addr, count):
+                self.out(f"  {a:08x}: {raw.hex(' '):<20} {text}")
+                addr = (a + len(raw)) & 0xFFFFFFFF
+            self._last_addr = addr
+            return
+        size = {"b": 1, "h": 2, "w": 4}[unit]
+        per = 16 // size
+        vals = []
+        for i in range(count):
+            a = (addr + i * size) & 0xFFFFFFFF
+            try:
+                v = (p.mem.read_u8(a) if size == 1 else
+                     p.mem.read_u16(a) if size == 2 else p.mem.read_u32(a))
+            except Exception:
+                vals.append("<越界>")
+                continue
+            vals.append(self._fmt_unit(v, fmt, size))
+        for i in range(0, len(vals), per):
+            chunk = vals[i:i + per]
+            self.out(f"  {(addr + i * size) & 0xFFFFFFFF:08x}: "
+                     + " ".join(chunk))
+        self._last_addr = (addr + count * size) & 0xFFFFFFFF
+
+    @staticmethod
+    def _fmt_unit(v: int, fmt: str, size: int) -> str:
+        if fmt == "d":
+            sign = 1 << (size * 8 - 1)
+            return str(v - (1 << (size * 8)) if v & sign else v)
+        if fmt == "u":
+            return str(v)
+        if fmt == "c":
+            return repr(chr(v & 0xFF))
+        return f"0x{v:0{size * 2}x}"
+
+    def cmd_break(self, args: List[str]) -> None:
+        k = self.k
+        if not args or args[0] in ("list", "ls"):
+            if not k.breakpoints:
+                self.out("没有断点。")
+            else:
+                self.out("断点: " + ", ".join(f"0x{a:x}"
+                                             for a in sorted(k.breakpoints)))
+            return
+        if args[0] in ("del", "delete", "d", "clear"):
+            if len(args) > 1 and args[1] == "all":
+                k.breakpoints.clear()
+                self.out("已清除所有断点。")
+                return
+            a = self._parse_addr(args[1], self._debug_proc()) if len(args) > 1 \
+                else None
+            if a is not None:
+                k.breakpoints.discard(a)
+                self.out(f"已删断点 0x{a:x}。")
+            return
+        a = self._parse_addr(args[0], self._debug_proc())
+        if a is not None:
+            k.breakpoints.add(a)
+            self.out(f"已设断点 0x{a:x}。")
+
+    def cmd_until(self, args: List[str]) -> bool:
+        p = self._debug_proc()
+        if not args:
+            self.out("用法: until <addr>")
+            return False
+        a = self._parse_addr(args[0], p)
+        if a is None:
+            return False
+        self.k.temp_breakpoints.add(a)
+        return True                          # 离开 monitor 跑到该地址
+
+    def info_console(self, args: List[str] = None) -> None:
+        term = self.k.terminal
+        tail = getattr(term, "console_tail", None)
+        if tail is None:
+            self.out("此终端没有输出留存。")
+            return
+        data = bytes(tail)
+        if not data:
+            self.out("控制台还没有输出。")
+            return
+        text = data.decode("utf-8", "replace")
+        self.out(f"最近控制台输出({len(data)} 字节):")
+        for line in text.splitlines():
+            self.out("  " + line)
+
+    def _parse_addr(self, tok: str, p=None):
+        """解析地址: 0x.. / 十进制 / 寄存器名(eip|esp|$eax..)。失败返回 None 并报错。"""
+        tok = tok.strip()
+        name = tok[1:] if tok.startswith("$") else tok   # 认 gdb 的 $ 前缀
+        if name in ("eip", "pc"):
+            name = "_eip"
+        if name == "_eip" or name in cpu86.REG32_NAMES:
+            if p is None or p.cpu is None:
+                self.out("没有当前进程的寄存器可用。")
+                return None
+            return p.cpu.eip if name == "_eip" \
+                else p.cpu.regs[cpu86.REG32_NAMES.index(name)]
+        try:
+            return int(tok, 0) & 0xFFFFFFFF
+        except ValueError:
+            self.out(f"无效地址: {tok}")
+            return None
