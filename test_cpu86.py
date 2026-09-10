@@ -1255,6 +1255,51 @@ class TestTrapsAndFaults(unittest.TestCase):
         with self.assertRaises(SegFault):
             cpu.run(10)
 
+    def test_icache_invalidated_when_text_rewritten(self):
+        """写 text 区必须让解码缓存失效, 否则改过的代码还按旧指令跑."""
+        cpu = build_cpu(mov_ri(EAX, 1), HLT)
+        cpu.step()                                  # mov eax,1 已解码并缓存
+        self.assertEqual(cpu.regs[EAX], 1)
+        self.assertIsNotNone(cpu.mem.icache[0])
+        cpu.mem.write(0, mov_ri(EAX, 2))            # 改写同一地址的指令
+        self.assertIsNone(cpu.mem.icache[0])
+        cpu.eip = 0
+        cpu.step()
+        self.assertEqual(cpu.regs[EAX], 2)
+
+    def test_icache_covers_only_text(self):
+        """缓存表长度等于 text 长度; 数据区/栈上的代码照常执行但不缓存."""
+        code = mov_ri(EAX, 7) + HLT
+        cpu = build_cpu(code, data_size=0x100)
+        self.assertEqual(len(cpu.mem.icache), len(code))
+        # 把一段代码放到 data 区并跳过去执行
+        cpu.mem.write(len(code), mov_ri(EBX, 9) + HLT)
+        cpu.eip = len(code)
+        cpu.run(10)
+        self.assertEqual(cpu.regs[EBX], 9)
+        self.assertTrue(cpu.halted)
+
+    def test_icache_clone_is_independent(self):
+        """fork 克隆的地址空间带走缓存副本, 之后各改各的 text 互不影响."""
+        cpu = build_cpu(mov_ri(EAX, 1), HLT)
+        cpu.step()
+        child = CPU(cpu.mem.clone())
+        child.regs[ESP] = cpu.regs[ESP]
+        child.mem.write(0, mov_ri(EAX, 5))          # 只改子进程的 text
+        child.run(1)
+        self.assertEqual(child.regs[EAX], 5)
+        self.assertIsNotNone(cpu.mem.icache[0])     # 父进程缓存未被牵连
+        cpu.eip = 0
+        cpu.run(1)
+        self.assertEqual(cpu.regs[EAX], 1)
+
+    def test_run_counts_hlt_and_stops(self):
+        cpu = build_cpu(NOP, NOP, HLT, NOP)
+        self.assertEqual(cpu.run(100), 3)           # hlt 那条也算执行了
+        self.assertTrue(cpu.halted)
+        self.assertEqual(cpu.icount, 3)
+        self.assertEqual(cpu.run(100), 0)           # 已停机不再执行
+
     def test_unimplemented_opcode_reports_eip_and_bytes(self):
         cpu = build_cpu(NOP, b"\x62\x00")          # 0x62 = bound, 未实现
         cpu.step()                                  # nop

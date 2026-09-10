@@ -43,7 +43,10 @@ class AddressSpace:
     """单个进程的地址空间."""
 
     __slots__ = ("low", "low_end", "stack", "stack_low",
-                 "brk", "text_end", "start_stack")
+                 "brk", "text_end", "start_stack", "icache")
+
+    # text 超过这个尺寸就不建解码缓存(list 按 eip 下标, 每项 8 字节指针)
+    ICACHE_MAX_TEXT = 8 << 20
 
     def __init__(self, stack_size: int = DEFAULT_STACK):
         self.low = bytearray()          # 从虚址 0 开始
@@ -54,6 +57,9 @@ class AddressSpace:
         self.brk = 0
         self.text_end = 0               # 供 CPU 做自修改代码检测
         self.start_stack = TASK_SIZE
+        # 解码缓存: icache[eip] 是 CPU 解出的指令元组(None=未解码), 只覆盖 text 区。
+        # 由 CPU 填充; 这里只负责建表与写 text 时失效。
+        self.icache = []
 
     # ---- 装载与增长 ---------------------------------------------------
 
@@ -63,6 +69,8 @@ class AddressSpace:
         self.text_end = len(text)
         self.low_end = len(self.low)
         self.brk = self.low_end
+        n = self.text_end if self.text_end <= self.ICACHE_MAX_TEXT else 0
+        self.icache = [None] * n
 
     def set_brk(self, addr: int) -> int:
         """语义照抄 kernel/sys.c 的 sys_brk: 合法则更新, 恒返回当前 brk."""
@@ -100,7 +108,22 @@ class AddressSpace:
         new.brk = self.brk
         new.text_end = self.text_end
         new.start_stack = self.start_stack
+        new.icache = list(self.icache)  # 缓存项是纯常量元组, 可以整份带走; 不共享 list
         return new
+
+    def _flush_icache(self, addr: int, n: int) -> None:
+        """text 区 [addr, addr+n) 被改写: 就地清掉可能覆盖这段字节的缓存项.
+
+        一条指令最长 15 字节, 所以起点往前多清 15 项。就地切片赋值保持 list 身份,
+        CPU.run() 里持有的局部引用不会失效。
+        """
+        cache = self.icache
+        lo = addr - 15 if addr > 15 else 0
+        hi = addr + n
+        if hi > len(cache):
+            hi = len(cache)
+        if lo < hi:
+            cache[lo:hi] = [None] * (hi - lo)
 
     # ---- 访存 ---------------------------------------------------------
 
@@ -116,6 +139,8 @@ class AddressSpace:
         n = len(data)
         if 0 <= addr and addr + n <= self.low_end:
             self.low[addr:addr + n] = data
+            if addr < self.text_end:
+                self._flush_icache(addr, n)
             return
         if addr >= self.stack_low and addr + n <= TASK_SIZE:
             off = addr - self.stack_low
@@ -153,6 +178,8 @@ class AddressSpace:
         val &= 0xFF
         if 0 <= addr < self.low_end:
             self.low[addr] = val
+            if addr < self.text_end:
+                self._flush_icache(addr, 1)
             return
         if self.stack_low <= addr < TASK_SIZE:
             self.stack[addr - self.stack_low] = val
@@ -163,6 +190,8 @@ class AddressSpace:
         val &= 0xFFFF
         if 0 <= addr and addr + 2 <= self.low_end:
             _U16.pack_into(self.low, addr, val)
+            if addr < self.text_end:
+                self._flush_icache(addr, 2)
             return
         if addr >= self.stack_low and addr + 2 <= TASK_SIZE:
             _U16.pack_into(self.stack, addr - self.stack_low, val)
@@ -173,6 +202,8 @@ class AddressSpace:
         val &= 0xFFFFFFFF
         if 0 <= addr and addr + 4 <= self.low_end:
             _U32.pack_into(self.low, addr, val)
+            if addr < self.text_end:
+                self._flush_icache(addr, 4)
             return
         if addr >= self.stack_low and addr + 4 <= TASK_SIZE:
             _U32.pack_into(self.stack, addr - self.stack_low, val)
