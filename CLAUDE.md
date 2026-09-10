@@ -133,6 +133,13 @@ cpu86.py → x86mem.py                              CPU 层不 import minixfs �
   ③ 管道读写端计数按**描述符**增减(`_acquire_fd`), 不能等 OpenFile 的 refs 归零,
      否则 fork 后写端永远关不掉, 流水线死锁。
 - `execve` 必须抛 `Replaced` 打断旧 `cpu.run()` 循环(旧 CPU 持有已失效的内存)。
+- **CPU 热路径纪律**(实测约 0.4 → 1.0 MIPS 的来源, 别改回去): 不给 `CPU` 加
+  `__setattr__/__getattr__` 钩子(寄存器名字访问用 `_reg_property`); `x86mem` 的 u16/u32
+  读写用 `unpack_from/pack_into` 直读 bytearray, 不 `bytes(切片)` 再 `unpack`; 按尺寸取
+  mask/符号位查模块级元组 `_MASK/_SIGN`; `step`/`_modrm` 把 `eip/mem/regs` 放局部变量、
+  末尾只写回一次 `self.eip`。任何逐指令开销都会被放大数千万倍, 改动前后跑
+  `python3 emulator.py hdc-0.11.img /usr/bin/gzip -c /bin/date | md5sum`(应为
+  d4bc050cbdacd8db08423d8dc7a43313)并计时。后续阶段方案见 `docs/performance-plan.md`。
 - x87 未实现(镜像 libc 是软浮点), 遇到就抛带 eip 与机器码字节的 `CpuError` —— 这是
   刻意的策略, 别改成静默跳过。
 - 镜像自身的坑: 无 `/dev/console`、无 `/etc/inittab`、`/dev/null` 被误建为块设备

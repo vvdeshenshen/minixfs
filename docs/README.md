@@ -25,3 +25,6 @@
   termios 模型、行规程(规范/非规范)、转义键、输出与控制台留存、ioctl、平台后端。
 - [monitor-and-debugger.md](monitor-and-debugger.md) —— kmonitor.py + cpu_disasm.py:
   monitor 架构与视图、CJK 排版、性能剖析视图、gdb 风格单步调试与只读反汇编器。
+- [performance-plan.md](performance-plan.md) —— 仿真器性能提升方案(纯标准库):
+  实测热点与原型数据、已落地的阶段一微优化、查表分派/解码缓存/惰性标志的设计与
+  实施顺序、与现有代码的耦合坑清单。
