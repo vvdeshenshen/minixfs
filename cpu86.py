@@ -205,6 +205,30 @@ def _sx32(v: int) -> int:
     return v - 0x100000000 if v >= SIGN32 else v
 
 
+# 按操作数尺寸(字节数)查 mask / 符号位: 元组下标比静态方法调用便宜一个量级
+_MASK = (0, 0xFF, 0xFFFF, 0, 0xFFFFFFFF)
+_SIGN = (0, 0x80, 0x8000, 0, 0x80000000)
+
+# 前缀字节集合: 0x66 操作数尺寸, 段前缀, lock, rep/repne
+_PREFIXES = frozenset({0x66, 0x2E, 0x36, 0x3E, 0x26, 0x64, 0x65,
+                       0xF0, 0xF2, 0xF3})
+
+
+def _reg_property(idx: int) -> property:
+    """按名字访问 32 位寄存器(cpu.eax 等)的 property。
+
+    早先用 __getattr__/__setattr__ 钩子实现, 代价是热循环里每次 self.eip=/
+    self.flags= 赋值都要先过一遍 Python 级的 `name in REG32_NAMES` 判断,
+    实测占总耗时约 19%; property 只在真正按名字访问寄存器时才有开销。
+    """
+    def getter(self):
+        return self.regs[idx]
+
+    def setter(self, val):
+        self.regs[idx] = val & MASK32
+    return property(getter, setter)
+
+
 class CPU:
     """i386 用户态解释器."""
 
@@ -245,18 +269,15 @@ class CPU:
     def set_reg16(self, idx: int, val: int) -> None:
         self.regs[idx] = (self.regs[idx] & 0xFFFF0000) | (val & 0xFFFF)
 
-    # 便捷属性(测试与内核层用名字访问更清楚)
-    def __getattr__(self, name):
-        try:
-            return self.regs[REG32_NAMES.index(name)]
-        except ValueError:
-            raise AttributeError(name) from None
-
-    def __setattr__(self, name, value):
-        if name in REG32_NAMES:
-            self.regs[REG32_NAMES.index(name)] = value & MASK32
-        else:
-            object.__setattr__(self, name, value)
+    # 便捷属性(测试与内核层用名字访问更清楚), 见 _reg_property 的说明
+    eax = _reg_property(EAX)
+    ecx = _reg_property(ECX)
+    edx = _reg_property(EDX)
+    ebx = _reg_property(EBX)
+    esp = _reg_property(ESP)
+    ebp = _reg_property(EBP)
+    esi = _reg_property(ESI)
+    edi = _reg_property(EDI)
 
     @property
     def eflags(self) -> int:
@@ -269,18 +290,21 @@ class CPU:
     # ---- 取指 ---------------------------------------------------------
 
     def _fetch8(self) -> int:
-        v = self.mem.read_u8(self.eip)
-        self.eip = (self.eip + 1) & MASK32
+        eip = self.eip
+        v = self.mem.read_u8(eip)
+        self.eip = eip + 1
         return v
 
     def _fetch16(self) -> int:
-        v = self.mem.read_u16(self.eip)
-        self.eip = (self.eip + 2) & MASK32
+        eip = self.eip
+        v = self.mem.read_u16(eip)
+        self.eip = eip + 2
         return v
 
     def _fetch32(self) -> int:
-        v = self.mem.read_u32(self.eip)
-        self.eip = (self.eip + 4) & MASK32
+        eip = self.eip
+        v = self.mem.read_u32(eip)
+        self.eip = eip + 4
         return v
 
     # ---- 栈 -----------------------------------------------------------
@@ -325,109 +349,123 @@ class CPU:
         返回 (mod, reg, rm, addr): mod==3 时 addr 为 None(操作数在寄存器),
         否则 addr 是计算好的有效地址。
         """
-        modrm = self._fetch8()
+        # 热路径: 取指与符号扩展全部内联, eip 用局部变量, 末尾只写回一次
+        mem = self.mem
+        eip = self.eip
+        regs = self.regs
+        modrm = mem.read_u8(eip)
+        eip += 1
         mod = modrm >> 6
         reg = (modrm >> 3) & 7
         rm = modrm & 7
         if mod == 3:
+            self.eip = eip
             return mod, reg, rm, None
 
         if rm == 4:                       # 走 SIB
-            sib = self._fetch8()
-            scale = sib >> 6
+            sib = mem.read_u8(eip)
+            eip += 1
             index = (sib >> 3) & 7
             base = sib & 7
-            addr = 0
-            if index != 4:                # index==4(ESP) 表示无索引
-                addr += self.regs[index] << scale
+            # index==4(ESP) 表示无索引
+            addr = (regs[index] << (sib >> 6)) if index != 4 else 0
             if base == 5 and mod == 0:
-                addr += _sx32(self._fetch32())
+                d = mem.read_u32(eip)
+                eip += 4
+                addr += d - 0x100000000 if d & SIGN32 else d
             else:
-                addr += self.regs[base]
+                addr += regs[base]
         elif rm == 5 and mod == 0:        # disp32 绝对寻址
-            addr = _sx32(self._fetch32())
+            d = mem.read_u32(eip)
+            eip += 4
+            addr = d - 0x100000000 if d & SIGN32 else d
         else:
-            addr = self.regs[rm]
+            addr = regs[rm]
 
         if mod == 1:
-            addr += _sx8(self._fetch8())
+            d = mem.read_u8(eip)
+            eip += 1
+            addr += d - 256 if d & 0x80 else d
         elif mod == 2:
-            addr += _sx32(self._fetch32())
+            d = mem.read_u32(eip)
+            eip += 4
+            addr += d - 0x100000000 if d & SIGN32 else d
+        self.eip = eip
         return mod, reg, rm, addr & MASK32
 
     # ---- 操作数读写 ---------------------------------------------------
 
+    # 32 位操作数占绝大多数, 一律先判 size == 4
+
     def _read_rm(self, mod: int, rm: int, addr: Optional[int], size: int) -> int:
         if mod == 3:
+            if size == 4:
+                return self.regs[rm]
             if size == 1:
                 return self.get_reg8(rm)
-            if size == 2:
-                return self.get_reg16(rm)
-            return self.regs[rm] & MASK32
+            return self.regs[rm] & 0xFFFF
+        if size == 4:
+            return self.mem.read_u32(addr)
         if size == 1:
             return self.mem.read_u8(addr)
-        if size == 2:
-            return self.mem.read_u16(addr)
-        return self.mem.read_u32(addr)
+        return self.mem.read_u16(addr)
 
     def _write_rm(self, mod: int, rm: int, addr: Optional[int],
                   size: int, val: int) -> None:
         if mod == 3:
-            if size == 1:
-                self.set_reg8(rm, val)
-            elif size == 2:
-                self.set_reg16(rm, val)
-            else:
+            if size == 4:
                 self.regs[rm] = val & MASK32
+            elif size == 1:
+                self.set_reg8(rm, val)
+            else:
+                self.set_reg16(rm, val)
             return
-        if size == 1:
-            self.mem.write_u8(addr, val)
-        elif size == 2:
-            self.mem.write_u16(addr, val)
-        else:
+        if size == 4:
             self.mem.write_u32(addr, val)
+        elif size == 1:
+            self.mem.write_u8(addr, val)
+        else:
+            self.mem.write_u16(addr, val)
 
     def _read_reg(self, reg: int, size: int) -> int:
+        if size == 4:
+            return self.regs[reg]
         if size == 1:
             return self.get_reg8(reg)
-        if size == 2:
-            return self.get_reg16(reg)
-        return self.regs[reg] & MASK32
+        return self.regs[reg] & 0xFFFF
 
     def _write_reg(self, reg: int, size: int, val: int) -> None:
-        if size == 1:
-            self.set_reg8(reg, val)
-        elif size == 2:
-            self.set_reg16(reg, val)
-        else:
+        if size == 4:
             self.regs[reg] = val & MASK32
+        elif size == 1:
+            self.set_reg8(reg, val)
+        else:
+            self.set_reg16(reg, val)
 
     # ---- 标志位计算 ---------------------------------------------------
 
     @staticmethod
     def _mask_of(size: int) -> int:
-        return (1 << (size * 8)) - 1
+        return _MASK[size]
 
     @staticmethod
     def _sign_of(size: int) -> int:
-        return 1 << (size * 8 - 1)
+        return _SIGN[size]
 
     def _set_logic_flags(self, res: int, size: int) -> None:
         """and/or/xor/test: CF=OF=0, AF 未定义(置 0)."""
-        mask = self._mask_of(size)
-        res &= mask
+        res &= _MASK[size]
         f = EFLAGS_BASE | (self.flags & DF)
         if res == 0:
             f |= ZF
-        if res & self._sign_of(size):
+        if res & _SIGN[size]:
             f |= SF
-        f |= _PARITY[res & 0xFF]
-        self.flags = f
+        self.flags = f | _PARITY[res & 0xFF]
 
     def _set_add_flags(self, a: int, b: int, res: int, size: int,
                        carry_in: int = 0) -> None:
-        mask = self._mask_of(size)
-        sign = self._sign_of(size)
+        mask = _MASK[size]
+        sign = _SIGN[size]
         trunc = res & mask
         f = EFLAGS_BASE | (self.flags & DF)
         if res > mask:
@@ -440,13 +478,12 @@ class CPU:
             f |= OF
         if ((a & 0xF) + (b & 0xF) + carry_in) > 0xF:
             f |= AF
-        f |= _PARITY[trunc & 0xFF]
-        self.flags = f
+        self.flags = f | _PARITY[trunc & 0xFF]
 
     def _set_sub_flags(self, a: int, b: int, res: int, size: int,
                        borrow_in: int = 0) -> None:
-        mask = self._mask_of(size)
-        sign = self._sign_of(size)
+        mask = _MASK[size]
+        sign = _SIGN[size]
         trunc = res & mask
         f = EFLAGS_BASE | (self.flags & DF)
         if res < 0:
@@ -459,8 +496,7 @@ class CPU:
             f |= OF
         if ((a & 0xF) - (b & 0xF) - borrow_in) < 0:
             f |= AF
-        f |= _PARITY[trunc & 0xFF]
-        self.flags = f
+        self.flags = f | _PARITY[trunc & 0xFF]
 
     def _set_inc_flags(self, res: int, size: int, was_inc: bool,
                        before: int) -> None:
@@ -500,42 +536,40 @@ class CPU:
     def _alu(self, op: int, a: int, b: int, size: int) -> Optional[int]:
         """op: 0=add 1=or 2=adc 3=sbb 4=and 5=sub 6=xor 7=cmp.
 
-        返回结果(cmp 返回 None 表示不写回)。
+        返回结果(cmp 返回 None 表示不写回)。分支按出现频率排序。
         """
-        mask = self._mask_of(size)
-        if op == 0:
+        mask = _MASK[size]
+        if op == 0:                          # add
             res = a + b
             self._set_add_flags(a, b, res, size)
             return res & mask
-        if op == 1:
-            res = a | b
-            self._set_logic_flags(res, size)
-            return res & mask
-        if op == 2:
-            c = 1 if self.flags & CF else 0
-            res = a + b + c
-            self._set_add_flags(a, b, res, size, c)
-            return res & mask
-        if op == 3:
-            c = 1 if self.flags & CF else 0
-            res = a - b - c
-            self._set_sub_flags(a, b, res, size, c)
-            return res & mask
-        if op == 4:
-            res = a & b
-            self._set_logic_flags(res, size)
-            return res & mask
-        if op == 5:
+        if op == 5:                          # sub
             res = a - b
             self._set_sub_flags(a, b, res, size)
             return res & mask
-        if op == 6:
+        if op == 7:                          # cmp
+            self._set_sub_flags(a, b, a - b, size)
+            return None
+        if op == 4:                          # and(操作数已在尺寸内, 结果无需再截断)
+            res = a & b
+            self._set_logic_flags(res, size)
+            return res
+        if op == 1:                          # or
+            res = a | b
+            self._set_logic_flags(res, size)
+            return res
+        if op == 6:                          # xor
             res = a ^ b
             self._set_logic_flags(res, size)
+            return res
+        c = 1 if self.flags & CF else 0
+        if op == 2:                          # adc
+            res = a + b + c
+            self._set_add_flags(a, b, res, size, c)
             return res & mask
-        # cmp
-        self._set_sub_flags(a, b, a - b, size)
-        return None
+        res = a - b - c                      # sbb
+        self._set_sub_flags(a, b, res, size, c)
+        return res & mask
 
     # ---- 主循环 -------------------------------------------------------
 
@@ -587,26 +621,31 @@ class CPU:
         if self.eip >= MAGIC_EIP_BASE:
             # 执行流落到魔数地址: 内核用它兜底信号返回(restorer 为 0 时)
             raise MagicJump(self.eip)
-        self._insn_start = self.eip
+        eip = self.eip
+        self._insn_start = eip
+        mem = self.mem
+        # 首字节直接从低区取(代码必在 text 里); 落在低区之外才走带范围检查的慢路径
+        op = mem.low[eip] if eip < mem.low_end else mem.read_u8(eip)
+        eip += 1
+        if op not in _PREFIXES:       # 绝大多数指令无前缀: 快路径
+            self.eip = eip
+            self._execute(op, 4)
+            return
         opsize = 4
         rep = 0                       # 0=无, 0xF3=rep/repe, 0xF2=repne
-        while True:
-            op = self._fetch8()
+        while op in _PREFIXES:
             if op == 0x66:            # 操作数尺寸前缀
                 opsize = 2
-                continue
-            if op in (0x2E, 0x36, 0x3E, 0x26, 0x64, 0x65):
-                continue              # 段前缀: 平坦模型下忽略
-            if op == 0xF0:            # lock
-                continue
-            if op in (0xF2, 0xF3):
+            elif op == 0xF2 or op == 0xF3:
                 rep = op
-                continue
-            break
+            # 其余(段前缀/lock): 平坦模型下忽略
+            op = mem.read_u8(eip)
+            eip += 1
+        self.eip = eip
         if rep and 0xA4 <= op <= 0xAF:
             self._string_op(op, opsize, rep)
             return
-        if rep and op in (0x90,):     # pause = f3 90
+        if rep and op == 0x90:        # pause = f3 90
             return
         self._execute(op, opsize)
 
